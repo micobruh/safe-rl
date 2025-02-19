@@ -13,9 +13,8 @@ We recommend using python 3.8.
 Note that pip install the whole package directly is not recommended because the newest version is not in PyPI yet.
 Code to install:
 ```
-wget https://github.com/PKU-Alignment/safety-gymnasium/archive/refs/heads/main.zip
-unzip main.zip
-cd safety-gymnasium-main
+git clone https://github.com/PKU-Alignment/safety-gymnasium.git
+cd safety-gymnasium
 pip install -e .
 ```
 
