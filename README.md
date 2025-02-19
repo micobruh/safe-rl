@@ -7,10 +7,17 @@ conda create -n safe_env python=3.8
 conda activate safe_env
 ```
 
-# 2. Installing Safety Gymnasium package
+# 2. Run in Linux
+It is recommended to run this module in Linux for fewer troubleshootings.
+Code to run in Linux:
+```
+wsl
+cd
+```
+
+# 3. Installing Safety Gymnasium package
 It is important that the python version should not be 3.11 or higher because of pygame compatibility.
 We recommend using python 3.8.
-Note that pip install the whole package directly is not recommended because the newest version is not in PyPI yet.
 Code to install:
 ```
 git clone https://github.com/PKU-Alignment/safety-gymnasium.git
@@ -18,5 +25,10 @@ cd safety-gymnasium
 pip install -e .
 ```
 
-# 3. Installing Other Relevant Packages
-Run requirements.txt to install all of them.
+# 34. Installing This Package
+Code to install:
+```
+git clone https://github.com/micobruh/safety-rl.git
+cd safety-rl
+pip install -e .
+```
