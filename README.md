@@ -4,11 +4,11 @@
 
 The python environment should not be 3.11 or higher due to pygame compatibility (Used in Safety-Gymnasium package).
 
-We recommend using python 3.8.
+We recommend using python 3.9.
 
 Code to initialize environment (Replace <safe_env> with the actual environment name):
 ```
-conda create -n <safe_env> python=3.8
+conda create -n <safe_env> python=3.9
 conda activate <safe_env>
 ```
 
@@ -64,3 +64,19 @@ git clone https://github.com/micobruh/safety-rl.git
 cd safety-rl
 pip install -e .
 ```
+
+## 5. GPU running on Local Machine
+
+If your computer has GPU, you can utilize it to run the program
+
+First, install nvidia cuda toolkit:
+```
+sudo apt install nvidia-cuda-toolkit
+```
+
+Then, install pycuda:
+```
+pip install pycuda
+```
+
+If the device shows "cuda:0" is an option, then this works
