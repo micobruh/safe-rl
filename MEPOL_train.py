@@ -1,4 +1,4 @@
-from src.agents import MEPOL
+from src.agents.MEPOL import MEPOL
 
 MEPOL(env_id = "SafetyPointGoal2-v0", k = 4, delta = 0.1, max_off_iters = 30,
           use_backtracking = 1, backtrack_coeff = 2, max_backtrack_try = 10, eps = 0,

@@ -298,12 +298,12 @@ def MEPOL(env_id, k, delta, max_off_iters,
     gamma: Discount factor of cost over time
     """  
     env = safety_gymnasium.make(env_id, render_mode = 'human', max_episode_steps = N)
-    # Seed everything
-    if seed is not None:
-        # Seed everything
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        env.seed(seed)
+    # # Seed everything
+    # if seed is not None:
+    #     # Seed everything
+    #     np.random.seed(seed)
+    #     torch.manual_seed(seed)
+    #     env.seed(seed)
 
     # Initialize policy neural network (theta)
     state_dim = env.observation_space.shape[0]
