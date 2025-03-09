@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+torch.set_default_dtype(torch.float64)
+
 class QNetwork(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()

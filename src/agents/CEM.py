@@ -12,6 +12,8 @@ import scipy.special
 from src.policy import PolicyNetwork, train_supervised
 from src.q_val import QNetwork
 
+torch.set_default_dtype(torch.float64)
+
 def compute_v_value(policy, q_network, state, num_samples = 100):
     """
     Estimate V(s) by averaging Q(s, a) over actions sampled from the policy.

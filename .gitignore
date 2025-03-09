@@ -1,1 +1,5 @@
-
+*.csv
+*.pyc
+__pycache__/
+*.txt
+events.out.tfevents.*
