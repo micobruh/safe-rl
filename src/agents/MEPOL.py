@@ -628,3 +628,43 @@ def MEPOL(env_id, k, delta, max_off_iters,
                     )                                              
 
     return behavioral_policy
+
+def MEPOL_heatmap(env_id, T, N, heatmap_cmap, heatmap_labels, heatmap_interp, transform_fn):    
+    """
+    T: Number of trajectories/episodes
+    N: Number of time steps
+    """
+    if torch.cuda.is_available():
+        dev = "cuda:0"
+        print("\nThere is GPU")
+    else:
+        dev = "cpu"
+        print("\nThere is no GPU")
+    device = torch.device(dev)    
+
+    envs = safety_gymnasium.vector.make(env_id, max_episode_steps = N, num_envs = T)
+    heatmap_discretizer = create_discretizer(envs, transform_fn=transform_fn)
+
+    # Initialize policy neural network (theta)
+    state_dim = envs.single_observation_space.shape[0]
+    action_dim = envs.single_action_space.shape[0]
+
+    model_lst = ["./results/full_MEPOL/0-policy", "./results/full_MEPOL/500-policy"]
+    iter_lst = [0, 500]
+
+    for model_link, iter_nr in zip(model_lst, iter_lst):
+        # Create a behavioral, a target policy and a tmp policy used to save valid target policies
+        # (those with kl <= kl_threshold) during off policy opt
+        behavioral_policy = PolicyNetwork(state_dim, action_dim, device)  # Recreate the model architecture
+        behavioral_policy.load_state_dict(torch.load(model_link))
+        behavioral_policy.to(device)  # Move model to the correct device (CPU/GPU)
+        behavioral_policy.eval()  # Set to evaluation mode (disables dropout, batch norm, etc.)
+
+        # Heatmap
+        _, average_entropy, heatmap_image = \
+            get_heatmap(envs, behavioral_policy, heatmap_discretizer, N,
+                        heatmap_cmap, heatmap_interp, heatmap_labels, device)
+        print(f"\nHeatmap Entropy at epoch {iter_nr}: {average_entropy}")
+        
+        heatmap_image.savefig(f"./{iter_nr}_heatmap.png")
+        plt.close(heatmap_image)
