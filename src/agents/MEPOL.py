@@ -2,12 +2,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import gymnasium
 import safety_gymnasium
 from tqdm import tqdm, trange
 import time
 from sklearn.neighbors import NearestNeighbors
 import scipy
 import scipy.special
+from src.init_env import create_envs
 from src.policy import PolicyNetwork, train_supervised
 from tabulate import tabulate
 import matplotlib
@@ -20,16 +22,16 @@ int_type = torch.int64
 float_type = torch.float64
 torch.set_default_dtype(float_type)
 
-import torch
 
-def create_policy(env, state_dim, action_dim, learning_rate, device, is_behavioral=False):
+def create_policy(env, state_dim, action_dim, learning_rate, is_discrete, device, is_behavioral=False):
 
-    policy = PolicyNetwork(state_dim, action_dim, device).to(device)
+    policy = PolicyNetwork(state_dim, action_dim, is_discrete, device).to(device)
 
     if is_behavioral:
-        policy = train_supervised(env, policy, learning_rate, device, train_steps=100, batch_size=5000)
+        policy = train_supervised(env, policy, learning_rate, device, train_steps=100)
 
     return policy
+
 
 def get_heatmap(envs, policy, discretizer, num_steps,
                 cmap, interp, labels, device):
@@ -91,12 +93,16 @@ def get_heatmap(envs, policy, discretizer, num_steps,
 
     return average_state_dist, average_entropy, image_fig
 
-def collect_particles(envs, policy, num_traj, traj_len, state_dim, action_dim, device):
+
+def collect_particles(envs, policy, num_traj, traj_len, state_dim, action_dim, is_discrete):
     """
     Collects num_traj * traj_len samples in parallel across multiple environments.
     """
     states = np.zeros((num_traj, traj_len + 1, state_dim), dtype=np.float32)
-    actions = np.zeros((num_traj, traj_len, action_dim), dtype=np.float32)
+    if is_discrete:
+        actions = np.zeros((num_traj, traj_len, action_dim), dtype=np.int32)
+    else:
+        actions = np.zeros((num_traj, traj_len, action_dim), dtype=np.float32)
     costs = np.zeros((num_traj, traj_len, 1), dtype=np.float32)  # Cost is a scalar
     next_states = np.zeros((num_traj, traj_len, state_dim), dtype=np.float32)
 
@@ -124,33 +130,8 @@ def collect_particles(envs, policy, num_traj, traj_len, state_dim, action_dim, d
 
     return states, actions, costs, next_states
 
-# def collect_particles(env, policy, episode_nr, step_nr, state_dim, action_dim):
-#     """
-#     Collects samples by running policy in the env.
-#     """
-#     # State's dimension on step nr is one more to account for next state
-#     states = np.zeros((episode_nr, step_nr + 1, state_dim), dtype = np.float32)
-#     actions = np.zeros((episode_nr, step_nr, action_dim), dtype = np.float32)
-#     costs = np.zeros((episode_nr, step_nr, action_dim), dtype = np.float32)
-#     next_states = np.zeros((episode_nr, step_nr, state_dim), dtype = np.float32)
 
-#     # Storing information in "D"
-#     for episode in range(episode_nr):
-#         s = env.reset()
-#         for t in range(step_nr):
-#             states[episode, t] = s
-#             a = policy.predict(s).numpy()
-#             actions[episode, t] = a
-#             ns, _, c, _, _, _ = env.step(a)
-#             costs[episode, t] = c
-#             next_states[episode, t] = ns
-#             s = ns
-#         # Indicating the final (next) state
-#         states[episode, t + 1] = s
-
-#     return states, actions, costs, next_states
-
-def compute_importance_weights(behavioral_policy, target_policy, states, actions, episode_nr):
+def compute_importance_weights(behavioral_policy, target_policy, states, actions, episode_nr, is_discrete):
     # Initialize to None for the first concat
     importance_weights = None
 
@@ -162,8 +143,8 @@ def compute_importance_weights(behavioral_policy, target_policy, states, actions
         traj_states = states[episode, : -1]
         traj_actions = actions[episode]
 
-        traj_target_log_p = target_policy.get_log_p(traj_states, traj_actions)
-        traj_behavior_log_p = behavioral_policy.get_log_p(traj_states, traj_actions)
+        traj_target_log_p = target_policy.get_log_p(traj_states, traj_actions, is_discrete)
+        traj_behavior_log_p = behavioral_policy.get_log_p(traj_states, traj_actions, is_discrete)
 
         traj_particle_iw = torch.exp(torch.cumsum(traj_target_log_p - traj_behavior_log_p, dim = 0))
 
@@ -176,9 +157,10 @@ def compute_importance_weights(behavioral_policy, target_policy, states, actions
     importance_weights /= torch.sum(importance_weights)
     return importance_weights
 
+
 def compute_entropy(behavioral_policy, target_policy, states, actions,
-                    episode_nr, distances, indices, k, G, B, ns, eps):
-    importance_weights = compute_importance_weights(behavioral_policy, target_policy, states, actions, episode_nr)
+                    episode_nr, distances, indices, k, G, B, ns, eps, is_discrete):
+    importance_weights = compute_importance_weights(behavioral_policy, target_policy, states, actions, episode_nr, is_discrete)
     # Compute objective function
     # compute weights sum for each particle
     weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim=1)
@@ -189,9 +171,10 @@ def compute_entropy(behavioral_policy, target_policy, states, actions,
 
     return entropy
 
+
 def compute_kl(behavioral_policy, target_policy, states, actions,
-               episode_nr, indices, k, eps):
-    importance_weights = compute_importance_weights(behavioral_policy, target_policy, states, actions, episode_nr)
+               episode_nr, indices, k, eps, is_discrete):
+    importance_weights = compute_importance_weights(behavioral_policy, target_policy, states, actions, episode_nr, is_discrete)
 
     weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim = 1)
 
@@ -207,6 +190,7 @@ def compute_kl(behavioral_policy, target_policy, states, actions,
 
     return kl, numeric_error
 
+
 def compute_discounted_cost(costs, device, gamma=0.99):
     """
     Computes the discounted sum of costs over timesteps for each trajectory.
@@ -219,15 +203,18 @@ def compute_discounted_cost(costs, device, gamma=0.99):
     # Compute discounted sum along timesteps (axis=1)
     discounted_costs = torch.sum(costs * discount_factors, dim=1)  # Shape (num_traj, 1)
 
-    # Compute mean across trajectories & move result to CPU
-    aggregated_cost = discounted_costs.mean().cpu()
+    # Compute mean and variance across trajectories & move result to CPU
+    mean_cost = discounted_costs.mean().cpu()
+    sd_cost = discounted_costs.std().cpu()
 
-    return aggregated_cost  # Final output is a scalar on CPU
+    return mean_cost, sd_cost
+
 
 def collect_particles_and_compute_knn(envs, behavioral_policy, episode_nr, step_nr,
-                                      state_dim, action_dim, k, num_workers, device):
+                                      state_dim, action_dim, k, num_workers, is_discrete, device):
     # Run simulations
-    states, actions, costs, next_states = collect_particles(envs, behavioral_policy, episode_nr, step_nr, state_dim, action_dim, device)
+    states, actions, costs, next_states = collect_particles(envs, behavioral_policy, episode_nr, step_nr, 
+                                                            state_dim, action_dim, is_discrete, device)
 
     print("\nCompute KNN starts")
     # Fit kNN for state density estimation
@@ -239,7 +226,10 @@ def collect_particles_and_compute_knn(envs, behavioral_policy, episode_nr, step_
 
     # Convert to PyTorch tensors
     states = torch.tensor(states, dtype=float_type, device=device)
-    actions = torch.tensor(actions, dtype=float_type, device=device)
+    if is_discrete:
+        actions = torch.tensor(actions, dtype=int_type, device=device)
+    else:
+        actions = torch.tensor(actions, dtype=float_type, device=device)
     costs = torch.tensor(costs, dtype=float_type, device=device)
     next_states = torch.tensor(next_states, dtype=float_type, device=device)
     distances = torch.tensor(distances, dtype=float_type, device=device)
@@ -247,34 +237,6 @@ def collect_particles_and_compute_knn(envs, behavioral_policy, episode_nr, step_
 
     return states, actions, costs, next_states, distances, indices
 
-
-
-# def collect_particles_and_compute_knn(env, behavioral_policy, episode_nr, step_nr,
-#                                       state_dim, action_dim, k, num_workers):
-#     assert episode_nr % num_workers == 0, "Please provide a number of trajectories " \
-#                                         "that can be equally split among workers"
-
-#     # Collect particles using behavioral policy
-#     res = Parallel(n_jobs=num_workers)(
-#         delayed(collect_particles)(env, behavioral_policy, int(episode_nr / num_workers), step_nr, state_dim, action_dim)
-#         for _ in range(num_workers)
-#     )
-#     states, actions, costs, next_states = [np.vstack(x) for x in zip(*res)]
-
-#     # Fit knn for the batch of collected particles
-#     nbrs = NearestNeighbors(n_neighbors = k + 1, metric = 'euclidean', algorithm = 'auto', n_jobs = num_workers)
-#     nbrs.fit(next_states)
-#     distances, indices = nbrs.kneighbors(next_states)
-
-#     # Return tensors so that downstream computations can be moved to any target device (#todo)
-#     states = torch.tensor(states, dtype = float_type)
-#     actions = torch.tensor(actions, dtype = float_type)
-#     costs = torch.tensor(costs, dtype = float_type)
-#     next_states = torch.tensor(next_states, dtype = float_type)
-#     distances = torch.tensor(distances, dtype = float_type)
-#     indices = torch.tensor(indices, dtype = int_type)
-
-#     return states, actions, costs, next_states, distances, indices
 
 def log_epoch_statistics(writer, log_file, csv_file_1, csv_file_2, epoch,
                          loss, entropy, mean_cost, num_off_iters, execution_time,
@@ -328,6 +290,7 @@ def log_epoch_statistics(writer, log_file, csv_file_1, csv_file_2, epoch,
     log_file.flush()
     print(fancy_grid)
 
+
 def log_off_iter_statistics(writer, csv_file_3, epoch, global_off_iter,
                             num_off_iter, entropy, kl, mean_cost, lr):
     # Log to csv file 3
@@ -339,14 +302,15 @@ def log_off_iter_statistics(writer, csv_file_3, epoch, global_off_iter,
     writer.add_scalar("Off policy iter Cost", mean_cost, global_step=global_off_iter)
     writer.add_scalar("Off policy iter KL", kl, global_step=global_off_iter)
 
+
 def policy_update(optimizer, behavioral_policy, target_policy, states, actions,
-                  episode_nr, distances, indices, k, G, B, ns, eps):
+                  episode_nr, distances, indices, k, G, B, ns, eps, is_discrete):
     optimizer.zero_grad()
 
     # Maximize entropy
     # TODO: Update this formula to include one extra term
     loss = -compute_entropy(behavioral_policy, target_policy, states, actions,
-                            episode_nr, distances, indices, k, G, B, ns, eps)
+                            episode_nr, distances, indices, k, G, B, ns, eps, is_discrete)
 
     numeric_error = torch.isinf(loss) or torch.isnan(loss)
 
@@ -354,6 +318,7 @@ def policy_update(optimizer, behavioral_policy, target_policy, states, actions,
     optimizer.step()
 
     return loss, numeric_error
+
 
 def MEPOL(env_id, k, delta, max_off_iters,
           use_backtracking, backtrack_coeff, max_backtrack_try, eps,
@@ -378,7 +343,7 @@ def MEPOL(env_id, k, delta, max_off_iters,
         print("\nThere is no GPU")
     device = torch.device(dev)    
 
-    envs = safety_gymnasium.vector.make(env_id, max_episode_steps = N, num_envs = T)
+    envs = create_envs(env_id, max_episode_steps = N, num_envs = T)
     heatmap_discretizer = create_discretizer(envs)
     num_workers = min(os.cpu_count(), T)
     # # Seed everything
@@ -389,8 +354,12 @@ def MEPOL(env_id, k, delta, max_off_iters,
     #     envs.seed(seed)
 
     # Initialize policy neural network (theta)
+    is_discrete = isinstance(envs.single_action_space, gymnasium.spaces.Discrete)
     state_dim = envs.single_observation_space.shape[0]
-    action_dim = envs.single_action_space.shape[0]
+    if is_discrete:
+        action_dim = envs.single_action_space.n
+    else:
+        action_dim = envs.single_action_space.shape[0]
     # theta_nn = PolicyNetwork(state_dim, action_dim)
     # theta_nn = train_supervised(envs, theta_nn, lambda_policy, device)
     
@@ -403,9 +372,9 @@ def MEPOL(env_id, k, delta, max_off_iters,
 
     # Create a behavioral, a target policy and a tmp policy used to save valid target policies
     # (those with kl <= kl_threshold) during off policy opt
-    behavioral_policy = create_policy(envs, state_dim, action_dim, lambda_policy, device, is_behavioral=True)
-    target_policy = create_policy(envs, state_dim, action_dim, lambda_policy, device)
-    last_valid_target_policy = create_policy(envs, state_dim, action_dim, lambda_policy, device)
+    behavioral_policy = create_policy(envs, state_dim, action_dim, lambda_policy, is_discrete, device, is_behavioral=True)
+    target_policy = create_policy(envs, state_dim, action_dim, lambda_policy, is_discrete, device)
+    last_valid_target_policy = create_policy(envs, state_dim, action_dim, lambda_policy, is_discrete, device)
     target_policy.load_state_dict(behavioral_policy.state_dict())
     last_valid_target_policy.load_state_dict(behavioral_policy.state_dict())
 
@@ -446,18 +415,18 @@ def MEPOL(env_id, k, delta, max_off_iters,
     # Entropy
     states, actions, costs, next_states, distances, indices = \
         collect_particles_and_compute_knn(envs, behavioral_policy, T, N, 
-                                  state_dim, action_dim, k, num_workers, device)
+                                  state_dim, action_dim, k, num_workers, is_discrete, device)
 
     with torch.inference_mode():
         entropy = compute_entropy(behavioral_policy, behavioral_policy, states, actions,
-                                  T, distances, indices, k, G, B, ns, eps)        
+                                  T, distances, indices, k, G, B, ns, eps, is_discrete)        
 
     print("\nEntropy computed")
 
     execution_time = time.time() - t0
     entropy = entropy.cpu().numpy()
     loss = -entropy
-    mean_cost = compute_discounted_cost(costs, device, gamma=0.99)
+    mean_cost, std_cost = compute_discounted_cost(costs, device, gamma=0.99)
 
     # Heatmap
     if heatmap_discretizer is not None:
@@ -504,7 +473,7 @@ def MEPOL(env_id, k, delta, max_off_iters,
         # Collect particles to optimize off policy
         states, actions, costs, next_states, distances, indices = \
             collect_particles_and_compute_knn(envs, behavioral_policy, T, N, 
-                                  state_dim, action_dim, k, num_workers, device)
+                                  state_dim, action_dim, k, num_workers, is_discrete, device)
 
         if use_backtracking:
             lambda_policy = original_lr
@@ -520,16 +489,16 @@ def MEPOL(env_id, k, delta, max_off_iters,
             print("\nOptimizing KL continues")
             # Optimize policy      
             loss, numeric_error = policy_update(optimizer, behavioral_policy, target_policy, states,
-                                                actions, T, distances, indices, k, G, B, ns, eps)
+                                                actions, T, distances, indices, k, G, B, ns, eps, is_discrete)
             entropy = -loss.detach().cpu().numpy()
 
             with torch.inference_mode():
                 kl, kl_numeric_error = compute_kl(behavioral_policy, target_policy, states, actions,
-                                                  T, indices, k, eps)
+                                                  T, indices, k, eps, is_discrete)
 
             kl = kl.cpu().numpy()
 
-            mean_cost = compute_discounted_cost(costs, device, gamma=0.99)
+            mean_cost, std_cost = compute_discounted_cost(costs, device, gamma=0.99)
 
             if not numeric_error and not kl_numeric_error and kl <= delta:
                 # Valid update
@@ -571,7 +540,7 @@ def MEPOL(env_id, k, delta, max_off_iters,
                 # Compute entropy of new policy
                 with torch.inference_mode():
                     entropy = compute_entropy(behavioral_policy, behavioral_policy, states, actions,
-                                              T, distances, indices, k, G, B, ns, eps)
+                                              T, distances, indices, k, G, B, ns, eps, is_discrete)
 
                 if torch.isnan(entropy) or torch.isinf(entropy):
                     print("Aborting because final entropy is nan or inf...")
@@ -587,7 +556,7 @@ def MEPOL(env_id, k, delta, max_off_iters,
 
                     loss = -entropy.cpu().numpy()
                     entropy = entropy.cpu().numpy()
-                    mean_cost = compute_discounted_cost(costs, device, gamma=0.99)
+                    mean_cost, std_cost = compute_discounted_cost(costs, device, gamma=0.99)
                     execution_time = time.time() - t0
 
                     if epoch % heatmap_every == 0:
@@ -603,7 +572,7 @@ def MEPOL(env_id, k, delta, max_off_iters,
                         # Full entropy
                         states, actions, costs, next_states, distances, indices = \
                             collect_particles_and_compute_knn(envs, behavioral_policy, T, N, 
-                                                    state_dim, action_dim, k, num_workers, device)
+                                                    state_dim, action_dim, k, num_workers, is_discrete, device)
                         
                         # Save policy
                         torch.save(behavioral_policy.state_dict(), os.path.join(out_path, f"{epoch}-policy"))  
@@ -642,12 +611,16 @@ def MEPOL_heatmap(env_id, T, N, heatmap_cmap, heatmap_labels, heatmap_interp, tr
         print("\nThere is no GPU")
     device = torch.device(dev)    
 
-    envs = safety_gymnasium.vector.make(env_id, max_episode_steps = N, num_envs = T)
-    heatmap_discretizer = create_discretizer(envs, transform_fn=transform_fn)
+    envs = create_envs(env_id, max_episode_steps = N, num_envs = T)
+    heatmap_discretizer = create_discretizer(envs)
 
     # Initialize policy neural network (theta)
+    is_discrete = isinstance(envs.single_action_space, gymnasium.spaces.Discrete)
     state_dim = envs.single_observation_space.shape[0]
-    action_dim = envs.single_action_space.shape[0]
+    if is_discrete:
+        action_dim = envs.single_action_space.n
+    else:
+        action_dim = envs.single_action_space.shape[0]
 
     model_lst = ["./results/full_MEPOL/0-policy", "./results/full_MEPOL/500-policy"]
     iter_lst = [0, 500]
@@ -655,7 +628,7 @@ def MEPOL_heatmap(env_id, T, N, heatmap_cmap, heatmap_labels, heatmap_interp, tr
     for model_link, iter_nr in zip(model_lst, iter_lst):
         # Create a behavioral, a target policy and a tmp policy used to save valid target policies
         # (those with kl <= kl_threshold) during off policy opt
-        behavioral_policy = PolicyNetwork(state_dim, action_dim, device)  # Recreate the model architecture
+        behavioral_policy = PolicyNetwork(state_dim, action_dim, is_discrete, device)  # Recreate the model architecture
         behavioral_policy.load_state_dict(torch.load(model_link))
         behavioral_policy.to(device)  # Move model to the correct device (CPU/GPU)
         behavioral_policy.eval()  # Set to evaluation mode (disables dropout, batch norm, etc.)
