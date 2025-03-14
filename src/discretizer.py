@@ -29,8 +29,8 @@ def create_discretizer(envs, num_bins=40, transform_fn=lambda s: [s[0], s[1]]):
     Creates a Discretizer object for a given Safety Gymnasium environment.
     """
     # Get state space limits
-    state_low = envs.single_observation_space.low[12: 14]
-    state_high = envs.single_observation_space.high[12: 14]
+    state_low = envs.single_observation_space.low[: 2]
+    state_high = envs.single_observation_space.high[: 2]
 
     # Ensure valid finite values (replace -inf/inf with reasonable bounds)
     state_low = np.where(state_low == -np.inf, -10, state_low)

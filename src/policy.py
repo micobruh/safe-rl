@@ -14,8 +14,8 @@ class PolicyNetwork(nn.Module):
         layers = []
         
         # 2 Hidden layers
-        layers.extend((nn.Linear(state_dim, 400), nn.ReLU()))
-        layers.extend((nn.Linear(400, 300), nn.ReLU()))
+        layers.extend((nn.Linear(state_dim, 300), nn.ReLU()))
+        layers.extend((nn.Linear(300, 300), nn.ReLU()))
         self.net = nn.Sequential(*layers)
 
         # Output of the network: Mean and log standard deviation
@@ -45,7 +45,7 @@ class PolicyNetwork(nn.Module):
         mean, _ = self(states)
         if self.is_discrete:
             log_mean = torch.log(mean + self.eps)
-            return log_mean.gather(1, actions.unsqueeze(1)).squeeze(1)
+            return log_mean.gather(1, actions).squeeze(-1)
         else:
             return torch.sum(
                 -0.5 * (

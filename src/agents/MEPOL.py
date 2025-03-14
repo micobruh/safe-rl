@@ -34,7 +34,7 @@ def create_policy(env, state_dim, action_dim, learning_rate, is_discrete, device
 
 
 def get_heatmap(envs, policy, discretizer, num_steps,
-                cmap, interp, labels, device):
+                cmap, interp, labels, is_discrete, title = None):
     """
     Builds a log-probability state visitation heatmap by running
     the policy in env. The heatmap is built using the provided
@@ -55,6 +55,9 @@ def get_heatmap(envs, policy, discretizer, num_steps,
         # Convert states to tensor and predict actions
         with torch.inference_mode():
             a = policy.predict(s).cpu().numpy()  # Move actions to CPU for envs.step()
+
+        if is_discrete:
+            a = a.squeeze(-1)
 
         # Step all environments at once
         s, _, _, _, _, _ = envs.step(a)
@@ -90,6 +93,23 @@ def get_heatmap(envs, policy, discretizer, num_steps,
         plt.imshow(log_p.filled(min_log_p_ravel), interpolation=interp, cmap=cmap)
     else:
         plt.bar([i for i in range(discretizer.bins_sizes[0])], average_state_dist)
+    
+    # Safety constraint position in real world coordinates
+    safety_x_position = -0.5  # The x-value where the vertical line should be
+
+    # Get x-axis bin edges from the discretizer
+    x_bin_edges = discretizer.bins[0]  # Assuming first dimension corresponds to x
+
+    # Convert `safety_x_position` into **correct pixel index** in the heatmap
+    safety_x_index = np.searchsorted(x_bin_edges, safety_x_position)
+
+    # Plot vertical safety constraint **at correct bin index**
+    # plt.axvline(x=safety_x_index, color='r', label='Unsafe Region Boundary', linewidth=3)
+    plt.axvspan(plt.xlim()[0], safety_x_index, color='red', alpha=0.3, label="Unsafe Region")
+    plt.legend()
+
+    if title != None:
+        plt.title(title)
 
     return average_state_dist, average_entropy, image_fig
 
@@ -115,8 +135,11 @@ def collect_particles(envs, policy, num_traj, traj_len, state_dim, action_dim, i
         states[:, t] = s
 
         # Sample action from policy
-        a = policy.predict(s).cpu().numpy()
+        a = policy.predict(s).cpu().numpy()  
         actions[:, t] = a
+
+        if is_discrete:
+            a = a.squeeze(-1)      
 
         # Apply action to all environments
         s, _, cost, _, _, _ = envs.step(a)
@@ -143,8 +166,8 @@ def compute_importance_weights(behavioral_policy, target_policy, states, actions
         traj_states = states[episode, : -1]
         traj_actions = actions[episode]
 
-        traj_target_log_p = target_policy.get_log_p(traj_states, traj_actions, is_discrete)
-        traj_behavior_log_p = behavioral_policy.get_log_p(traj_states, traj_actions, is_discrete)
+        traj_target_log_p = target_policy.get_log_p(traj_states, traj_actions)
+        traj_behavior_log_p = behavioral_policy.get_log_p(traj_states, traj_actions)
 
         traj_particle_iw = torch.exp(torch.cumsum(traj_target_log_p - traj_behavior_log_p, dim = 0))
 
@@ -168,6 +191,11 @@ def compute_entropy(behavioral_policy, target_policy, states, actions,
     volumes = (torch.pow(distances[:, k], ns) * torch.pow(torch.tensor(np.pi), ns / 2)) / G
     # compute entropy
     entropy = -torch.sum((weights_sum / k) * torch.log((weights_sum / (volumes + eps)) + eps)) + B
+
+    if is_discrete:
+        entropy_bonus_weight = 0.01
+        entropy_bonus = entropy_bonus_weight * entropy
+        entropy = entropy + entropy_bonus        
 
     return entropy
 
@@ -214,7 +242,7 @@ def collect_particles_and_compute_knn(envs, behavioral_policy, episode_nr, step_
                                       state_dim, action_dim, k, num_workers, is_discrete, device):
     # Run simulations
     states, actions, costs, next_states = collect_particles(envs, behavioral_policy, episode_nr, step_nr, 
-                                                            state_dim, action_dim, is_discrete, device)
+                                                            state_dim, action_dim, is_discrete)
 
     print("\nCompute KNN starts")
     # Fit kNN for state density estimation
@@ -343,7 +371,7 @@ def MEPOL(env_id, k, delta, max_off_iters,
         print("\nThere is no GPU")
     device = torch.device(dev)    
 
-    envs = create_envs(env_id, max_episode_steps = N, num_envs = T)
+    envs = create_envs(env_id, N, T)
     heatmap_discretizer = create_discretizer(envs)
     num_workers = min(os.cpu_count(), T)
     # # Seed everything
@@ -357,7 +385,7 @@ def MEPOL(env_id, k, delta, max_off_iters,
     is_discrete = isinstance(envs.single_action_space, gymnasium.spaces.Discrete)
     state_dim = envs.single_observation_space.shape[0]
     if is_discrete:
-        action_dim = envs.single_action_space.n
+        action_dim = 1
     else:
         action_dim = envs.single_action_space.shape[0]
     # theta_nn = PolicyNetwork(state_dim, action_dim)
@@ -388,7 +416,7 @@ def MEPOL(env_id, k, delta, max_off_iters,
     log_file = open(os.path.join((out_path), 'log_file.txt'), 'a', encoding="utf-8")
 
     csv_file_1 = open(os.path.join(out_path, f"{env_id}.csv"), 'w')
-    csv_file_1.write(",".join(['epoch', 'loss', 'entropy', 'num_off_iters','execution_time']))
+    csv_file_1.write(",".join(['epoch', 'loss', 'entropy', 'cost', 'num_off_iters','execution_time']))
     csv_file_1.write("\n")
 
     if heatmap_discretizer is not None:
@@ -432,7 +460,9 @@ def MEPOL(env_id, k, delta, max_off_iters,
     if heatmap_discretizer is not None:
         _, heatmap_entropy, heatmap_image = \
             get_heatmap(envs, behavioral_policy, heatmap_discretizer, N,
-                        heatmap_cmap, heatmap_interp, heatmap_labels, device)
+                        heatmap_cmap, heatmap_interp, heatmap_labels, is_discrete)
+        heatmap_image.savefig(f"{out_path}/initial_heatmap.png")
+        plt.close(heatmap_image)
     else:
         heatmap_entropy = None
         heatmap_image = None
@@ -559,12 +589,14 @@ def MEPOL(env_id, k, delta, max_off_iters,
                     mean_cost, std_cost = compute_discounted_cost(costs, device, gamma=0.99)
                     execution_time = time.time() - t0
 
-                    if epoch % heatmap_every == 0:
+                    if epoch == epoch_nr - 1:
                         # Heatmap
                         if heatmap_discretizer is not None:
                             _, heatmap_entropy, heatmap_image = \
                                 get_heatmap(envs, behavioral_policy, heatmap_discretizer, N,
-                                            heatmap_cmap, heatmap_interp, heatmap_labels, device)
+                                            heatmap_cmap, heatmap_interp, heatmap_labels, is_discrete)
+                            heatmap_image.savefig(f"{out_path}/final_heatmap.png")
+                            plt.close(heatmap_image)                            
                         else:
                             heatmap_entropy = None
                             heatmap_image = None
@@ -611,33 +643,34 @@ def MEPOL_heatmap(env_id, T, N, heatmap_cmap, heatmap_labels, heatmap_interp, tr
         print("\nThere is no GPU")
     device = torch.device(dev)    
 
-    envs = create_envs(env_id, max_episode_steps = N, num_envs = T)
+    envs = create_envs(env_id, N, T)
     heatmap_discretizer = create_discretizer(envs)
 
     # Initialize policy neural network (theta)
     is_discrete = isinstance(envs.single_action_space, gymnasium.spaces.Discrete)
     state_dim = envs.single_observation_space.shape[0]
     if is_discrete:
-        action_dim = envs.single_action_space.n
+        action_dim = 1
     else:
         action_dim = envs.single_action_space.shape[0]
 
-    model_lst = ["./results/full_MEPOL/0-policy", "./results/full_MEPOL/500-policy"]
-    iter_lst = [0, 500]
+    model_lst = ["./results/MountainCarContinuous/MEPOL/0-policy", "./results/MountainCarContinuous/MEPOL/299-policy"]
+    title_lst = ["Initial", "Final"]
 
-    for model_link, iter_nr in zip(model_lst, iter_lst):
+    for model_link, title_txt in zip(model_lst, title_lst):
         # Create a behavioral, a target policy and a tmp policy used to save valid target policies
         # (those with kl <= kl_threshold) during off policy opt
         behavioral_policy = PolicyNetwork(state_dim, action_dim, is_discrete, device)  # Recreate the model architecture
         behavioral_policy.load_state_dict(torch.load(model_link))
         behavioral_policy.to(device)  # Move model to the correct device (CPU/GPU)
         behavioral_policy.eval()  # Set to evaluation mode (disables dropout, batch norm, etc.)
+        title = f"Heatmap of {title_txt} Epoch State Exploration"
 
         # Heatmap
         _, average_entropy, heatmap_image = \
             get_heatmap(envs, behavioral_policy, heatmap_discretizer, N,
-                        heatmap_cmap, heatmap_interp, heatmap_labels, device)
-        print(f"\nHeatmap Entropy at epoch {iter_nr}: {average_entropy}")
+                        heatmap_cmap, heatmap_interp, heatmap_labels, is_discrete, title)
+        print(f"\nHeatmap Entropy at {title_txt} Epoch: {average_entropy}")
         
-        heatmap_image.savefig(f"./{iter_nr}_heatmap.png")
+        heatmap_image.savefig(f"./{title_txt}_heatmap.png")
         plt.close(heatmap_image)
