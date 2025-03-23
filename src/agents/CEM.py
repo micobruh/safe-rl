@@ -167,20 +167,27 @@ class CEM:
                         distances, indices):
         importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
         # Compute objective function
-        # compute weights sum for each particle
-        weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim=1)
-        # compute volume for each particle
-        volumes = (torch.pow(distances[:, self.k], self.state_dim) * torch.pow(torch.tensor(np.pi), self.state_dim / 2)) / self.G
-        # compute entropy
-        entropy = -torch.sum((weights_sum / self.k) * torch.log((weights_sum / (volumes + self.eps)) + self.eps)) + self.B
+        # Compute weights sum for each particle        
+        weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim = 1)
+        # Compute volume for each particle
+        volumes = (torch.pow(distances[:, self.k], self.state_dim) *
+                torch.pow(torch.tensor(np.pi), self.state_dim / 2)) / self.G
+
+        # Compute entropy
+        entropy_terms = -(weights_sum / self.k) * torch.log((weights_sum / (volumes + self.eps)) + self.eps)
+        entropy_terms_per_episode = entropy_terms.view(self.episode_nr, self.step_nr)
+        entropy_per_episode = torch.sum(entropy_terms_per_episode, dim = 1) + self.B
+
+        # Final values
+        mean_entropy = torch.mean(entropy_per_episode)
+        std_entropy = torch.std(entropy_per_episode, unbiased=False)
 
         if self.is_discrete:
             entropy_bonus_weight = 0.01
-            entropy_bonus = entropy_bonus_weight * entropy
-            entropy += entropy_bonus        
+            mean_entropy += entropy_bonus_weight * mean_entropy
 
-        return entropy
-    
+        return mean_entropy, std_entropy
+
 
     def compute_discounted_cost(self, costs):
         """
@@ -194,9 +201,9 @@ class CEM:
 
         # Compute mean and variance across trajectories & move result to CPU
         mean_cost = discounted_costs.mean().cpu()
-        sd_cost = discounted_costs.std().cpu()
+        std_cost = discounted_costs.std().cpu()
 
-        return mean_cost, sd_cost
+        return mean_cost, std_cost
     
 
     def compute_advantage(self, behavioral_policy, target_policy, states, actions, costs, update = False):
@@ -271,15 +278,15 @@ class CEM:
         optimizer.zero_grad()
 
         # Maximize entropy
-        entropy = self.compute_entropy(behavioral_policy, target_policy, states, actions, distances, indices)
-        loss = -entropy + self.omega * advantage_loss
+        mean_entropy, std_entropy = self.compute_entropy(behavioral_policy, target_policy, states, actions, distances, indices)
+        loss = -mean_entropy + self.omega * advantage_loss
 
         numeric_error = torch.isinf(loss) or torch.isnan(loss)
 
         loss.backward()
         optimizer.step()
 
-        return loss, numeric_error, entropy
+        return loss, numeric_error, mean_entropy, std_entropy
 
     def get_heatmap(self, title = None):
         """
@@ -361,7 +368,8 @@ class CEM:
         return average_state_dist, average_entropy, image_fig
 
     def log_epoch_statistics(self, log_file, csv_file_1, csv_file_2, epoch,
-                            loss, entropy, mean_cost, num_off_iters, execution_time,
+                            value_loss, policy_loss, safety_weight, value_lr, 
+                            advantage, mean_entropy, std_entropy, mean_cost, std_cost, num_off_iters, execution_time,
                             heatmap_image, heatmap_entropy, backtrack_iters, backtrack_lr):
         # Prepare tabulate table
         table = []
@@ -369,7 +377,10 @@ class CEM:
         table.extend([
             ["Epoch", epoch],
             ["Execution time (s)", fancy_float(execution_time)],
-            ["Entropy", fancy_float(entropy)],
+            ["Value loss", fancy_float(value_loss)],
+            ["Policy loss", fancy_float(policy_loss)],
+            ["Advantage", fancy_float(advantage)],
+            ["Entropy", fancy_float(mean_entropy)],
             ["Cost", fancy_float(mean_cost)],
             ["Off-policy iters", num_off_iters]
         ])
@@ -387,7 +398,7 @@ class CEM:
         fancy_grid = tabulate(table, headers="firstrow", tablefmt="fancy_grid", numalign='right')
 
         # Log to csv file 1
-        csv_file_1.write(f"{epoch},{loss},{entropy},{mean_cost},{num_off_iters},{execution_time}\n")
+        csv_file_1.write(f"{epoch},{value_loss},{policy_loss},{safety_weight},{value_lr},{advantage},{mean_entropy},{std_entropy},{mean_cost},{std_cost},{num_off_iters},{execution_time}\n")
         csv_file_1.flush()
 
         # Log to csv file 2
@@ -401,10 +412,10 @@ class CEM:
         log_file.flush()
         print(fancy_grid)
 
-    def log_off_iter_statistics(self, csv_file_3, epoch, global_off_iter,
-                                num_off_iter, entropy, kl, mean_cost, lr):
+    def log_off_iter_statistics(self, csv_file_3, epoch, num_off_iter, global_off_iter,
+                                loss, advantage, mean_entropy, std_entropy, kl, mean_cost, std_cost, lr):
         # Log to csv file 3
-        csv_file_3.write(f"{epoch},{num_off_iter},{entropy},{kl},{mean_cost},{lr}\n")
+        csv_file_3.write(f"{epoch},{num_off_iter},{global_off_iter},{loss},{advantage},{mean_entropy},{std_entropy},{kl},{mean_cost},{std_cost},{lr}\n")
         csv_file_3.flush()
 
     def train(self):    
@@ -426,7 +437,7 @@ class CEM:
         #     torch.manual_seed(self.seed)
         #     envs.seed(self.seed)
 
-        # Initialize policy neural network (theta)
+        # Initialize policy neural network
         self.is_discrete = isinstance(self.envs.single_action_space, gymnasium.spaces.Discrete)
         self.state_dim = self.envs.single_observation_space.shape[0]
         if self.is_discrete:
@@ -445,7 +456,7 @@ class CEM:
         # Set optimizer for policy
         self.policy_optimizer = torch.optim.Adam(self.target_policy.parameters(), lr = self.lambda_policy)
 
-        # Create a value neural network
+        # Initialize value neural network
         self.value_nn = ValueNetwork(self.state_dim, self.device).to(self.device)
         self.value_optimizer = torch.optim.Adam(self.value_nn.parameters(), lr = self.lambda_value)       
 
@@ -453,7 +464,7 @@ class CEM:
         log_file = open(os.path.join((self.out_path), 'log_file.txt'), 'a', encoding="utf-8")
 
         csv_file_1 = open(os.path.join(self.out_path, f"{self.env_id}.csv"), 'w')
-        csv_file_1.write(",".join(['epoch', 'loss', 'entropy', 'cost', 'num_off_iters','execution_time']))
+        csv_file_1.write(",".join(['epoch', 'value_loss', 'policy_loss', 'safety_weight', 'value_learning_rate', 'advantage', 'mean_entropy', 'std_entropy', 'mean_cost', 'std_cost', 'num_off_iters','execution_time']))
         csv_file_1.write("\n")
 
         if self.heatmap_discretizer is not None:
@@ -464,7 +475,7 @@ class CEM:
             csv_file_2 = None
 
         csv_file_3 = open(os.path.join(self.out_path, f"{self.env_id}_off_policy_iter.csv"), "w")
-        csv_file_3.write(",".join(['epoch', 'off_policy_iter', 'entropy', 'kl', 'learning_rate']))
+        csv_file_3.write(",".join(['epoch', 'off_policy_iter', 'global_off_poliy_iter', 'loss', 'advantage', 'mean_entropy', 'std_entropy', 'kl', 'mean_cost', 'std_cost', 'policy_learning_rate']))
         csv_file_3.write("\n")
 
         # Fixed constants
@@ -481,14 +492,14 @@ class CEM:
             self.collect_particles_and_compute_knn()
 
         with torch.inference_mode():
-            entropy = self.compute_entropy(self.behavioral_policy, self.behavioral_policy, states, 
+            mean_entropy, std_entropy = self.compute_entropy(self.behavioral_policy, self.behavioral_policy, states, 
                                            actions, distances, indices)        
 
         print("\nEntropy computed")
 
         execution_time = time.time() - t0
-        entropy = entropy.cpu().numpy()
-        loss = -entropy
+        mean_entropy = mean_entropy.cpu().numpy()
+        std_entropy = std_entropy.cpu().numpy()
         mean_cost, std_cost = self.compute_discounted_cost(costs)
 
         # Heatmap
@@ -504,20 +515,28 @@ class CEM:
         # Save initial policy
         torch.save(self.behavioral_policy.state_dict(), os.path.join(self.out_path, f"{epoch}-policy"))
 
+        safety_weight = self.omega
+        value_lr = self.lambda_value
         # Log statistics for the initial policy
         self.log_epoch_statistics(
-                log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
-                epoch=epoch,
-                loss=loss,
-                entropy=entropy,
-                mean_cost=mean_cost,
-                execution_time=execution_time,
-                num_off_iters=0,
-                heatmap_image=heatmap_image,
-                heatmap_entropy=heatmap_entropy,
-                backtrack_iters=None,
-                backtrack_lr=None
-            )
+            log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
+            epoch=epoch,
+            value_loss=0,
+            policy_loss=0,
+            safety_weight=safety_weight,
+            value_lr=value_lr,
+            advantage=0,
+            mean_entropy=mean_entropy,
+            std_entropy=std_entropy,
+            mean_cost=mean_cost,
+            std_cost=std_cost,
+            num_off_iters=0,
+            execution_time=execution_time,
+            heatmap_image=heatmap_image,
+            heatmap_entropy=heatmap_entropy,
+            backtrack_iters=None,
+            backtrack_lr=None
+        )
 
         # Main Loop
         global_num_off_iters = 0
@@ -557,16 +576,19 @@ class CEM:
             value_loss = self.compute_advantage(self.behavioral_policy, self.target_policy, states, actions, costs, True)            
             value_loss.backward()
             self.value_optimizer.step()
+            value_loss = value_loss.detach().cpu().numpy()
 
             while not kl_threshold_reached:
                 print("\nOptimizing KL continues")
                 # Use the newly computed advantage loss
                 advantage_loss = self.compute_advantage(self.behavioral_policy, self.target_policy, states, actions, costs)                
                 # Update target policy network    
-                loss, numeric_error, entropy = self.policy_update(self.policy_optimizer, self.behavioral_policy, 
+                loss, numeric_error, mean_entropy, std_entropy = self.policy_update(self.policy_optimizer, self.behavioral_policy, 
                                                                      self.target_policy, states, actions, 
                                                                      advantage_loss, distances, indices)
-                entropy = entropy.detach().cpu().numpy()
+                mean_entropy = mean_entropy.detach().cpu().numpy()
+                std_entropy = std_entropy.detach().cpu().numpy()
+                loss = loss.detach().cpu().numpy()
 
                 with torch.inference_mode():
                     kl, kl_numeric_error = self.compute_kl(self.behavioral_policy, self.target_policy, states, actions, indices)
@@ -580,8 +602,8 @@ class CEM:
                     global_num_off_iters += 1
                     lr = self.lambda_policy
                     # Log statistics for this off policy iteration
-                    self.log_off_iter_statistics(csv_file_3, epoch, global_num_off_iters,
-                                                 num_off_iters - 1, entropy, kl, mean_behavorial_costs, lr)                
+                    self.log_off_iter_statistics(csv_file_3, epoch, num_off_iters - 1, global_num_off_iters - 1,
+                                                 loss, advantage_loss, mean_entropy, std_entropy, kl, mean_behavorial_costs, std_behavorial_costs, lr)                
 
                 else:
                     if self.use_backtracking:
@@ -614,10 +636,10 @@ class CEM:
                     # Compute entropy of new policy
                     with torch.inference_mode():
                         advantage_loss = self.compute_advantage(self.behavioral_policy, self.behavioral_policy, states, actions, costs)                        
-                        entropy = self.compute_entropy(self.behavioral_policy, self.behavioral_policy, states, 
+                        mean_entropy, std_entropy = self.compute_entropy(self.behavioral_policy, self.behavioral_policy, states, 
                                                        actions, distances, indices)
 
-                    if torch.isnan(entropy) or torch.isinf(entropy):
+                    if torch.isnan(mean_entropy) or torch.isinf(mean_entropy):
                         print("Aborting because final entropy is nan or inf...")
                         print("There is most likely a problem in knn aliasing. Use a higher k.")
                         exit()
@@ -629,8 +651,9 @@ class CEM:
                         self.behavioral_policy.load_state_dict(last_valid_target_policy.state_dict())
                         self.target_policy.load_state_dict(last_valid_target_policy.state_dict())
 
-                        loss = (-entropy + self.omega * advantage_loss).cpu().numpy()
-                        entropy = entropy.cpu().numpy()
+                        loss = (-mean_entropy + self.omega * advantage_loss).cpu().numpy()
+                        mean_entropy = mean_entropy.cpu().numpy()
+                        std_entropy = std_entropy.cpu().numpy()
                         mean_cost, std_cost = self.compute_discounted_cost(costs)
                         execution_time = time.time() - t0
 
@@ -657,20 +680,28 @@ class CEM:
                             heatmap_image = None
 
                         backtrack_lr = self.lambda_policy
-                        # Log statistics for this epoch
+                        safety_weight = self.omega
+                        value_lr = self.lambda_value
+                        # Log statistics for the initial policy
                         self.log_epoch_statistics(
                             log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
                             epoch=epoch,
-                            loss=loss,
-                            entropy=entropy,
+                            value_loss=value_loss,
+                            policy_loss=loss,
+                            safety_weight=safety_weight,
+                            value_lr=value_lr,
+                            advantage=advantage_loss,
+                            mean_entropy=mean_entropy,
+                            std_entropy=std_entropy,
                             mean_cost=mean_cost,
-                            execution_time=execution_time,
+                            std_cost=std_cost,
                             num_off_iters=num_off_iters,
+                            execution_time=execution_time,
                             heatmap_image=heatmap_image,
                             heatmap_entropy=heatmap_entropy,
-                            backtrack_iters=backtrack_iter,
-                            backtrack_lr=backtrack_lr
-                        )                                              
+                            backtrack_iters=None,
+                            backtrack_lr=None
+                        )                                                                    
 
         if isinstance(self.envs, gymnasium.vector.VectorEnv):
             self.envs.close()

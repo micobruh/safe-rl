@@ -152,37 +152,27 @@ class MEPOL:
     def compute_entropy(self, behavioral_policy, target_policy, states, actions,
                         distances, indices):
         importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
-        print(f"Importance weights shape: {importance_weights.shape}")
         # Compute objective function
-        # compute weights sum for each particle
-        weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim=1)
-        # compute volume for each particle
-        volumes = (torch.pow(distances[:, self.k], self.state_dim) * torch.pow(torch.tensor(np.pi), self.state_dim / 2)) / self.G
-        # compute entropy
-        entropy = -torch.sum((weights_sum / self.k) * torch.log((weights_sum / (volumes + self.eps)) + self.eps)) + self.B
+        # Compute weights sum for each particle        
+        weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim = 1)
+        # Compute volume for each particle
+        volumes = (torch.pow(distances[:, self.k], self.state_dim) *
+                torch.pow(torch.tensor(np.pi), self.state_dim / 2)) / self.G
+
+        # Compute entropy
+        entropy_terms = -(weights_sum / self.k) * torch.log((weights_sum / (volumes + self.eps)) + self.eps)
+        entropy_terms_per_episode = entropy_terms.view(self.episode_nr, self.step_nr)
+        entropy_per_episode = torch.sum(entropy_terms_per_episode, dim = 1) + self.B
+
+        # Final values
+        mean_entropy = torch.mean(entropy_per_episode)
+        std_entropy = torch.std(entropy_per_episode, unbiased=False)
 
         if self.is_discrete:
             entropy_bonus_weight = 0.01
-            entropy_bonus = entropy_bonus_weight * entropy
-            entropy += entropy_bonus        
+            mean_entropy += entropy_bonus_weight * mean_entropy
 
-        return entropy
-
-    def compute_kl(self, behavioral_policy, target_policy, states, actions, indices):
-        importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
-
-        weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim = 1)
-
-        # Compute KL divergence between behavioral and target policy
-        kl = (1 / self.episode_nr / self.step_nr) * torch.sum(torch.log(self.k / (self.episode_nr * self.step_nr * weights_sum) + self.eps))
-
-        numeric_error = torch.isinf(kl) or torch.isnan(kl)
-
-        # Minimum KL is zero
-        # NOTE: do not remove epsilon factor
-        kl = torch.max(torch.tensor(0.0), kl)
-
-        return kl, numeric_error
+        return mean_entropy, std_entropy
 
 
     def compute_discounted_cost(self, costs):
@@ -201,6 +191,23 @@ class MEPOL:
 
         return mean_cost, sd_cost
 
+
+    def compute_kl(self, behavioral_policy, target_policy, states, actions, indices):
+        importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
+
+        weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim = 1)
+
+        # Compute KL divergence between behavioral and target policy
+        kl = (1 / self.episode_nr / self.step_nr) * torch.sum(torch.log(self.k / (self.episode_nr * self.step_nr * weights_sum) + self.eps))
+
+        numeric_error = torch.isinf(kl) or torch.isnan(kl)
+
+        # Minimum KL is zero
+        # NOTE: do not remove epsilon factor
+        kl = torch.max(torch.tensor(0.0), kl)
+
+        return kl, numeric_error
+    
 
     def collect_particles_and_compute_knn(self):
         # Run simulations
@@ -231,14 +238,15 @@ class MEPOL:
         optimizer.zero_grad()
 
         # Maximize entropy
-        loss = -self.compute_entropy(behavioral_policy, target_policy, states, actions, distances, indices)
+        mean_entropy, std_entropy = self.compute_entropy(behavioral_policy, target_policy, states, actions, distances, indices)
+        loss = -mean_entropy
 
         numeric_error = torch.isinf(loss) or torch.isnan(loss)
 
         loss.backward()
         optimizer.step()
 
-        return loss, numeric_error
+        return loss, numeric_error, mean_entropy, std_entropy
 
     def get_heatmap(self, title = None):
         """
@@ -320,7 +328,7 @@ class MEPOL:
         return average_state_dist, average_entropy, image_fig
 
     def log_epoch_statistics(self, log_file, csv_file_1, csv_file_2, epoch,
-                            loss, entropy, mean_cost, num_off_iters, execution_time,
+                            loss, mean_entropy, std_entropy, mean_cost, std_cost, num_off_iters, execution_time,
                             heatmap_image, heatmap_entropy, backtrack_iters, backtrack_lr):
         # Prepare tabulate table
         table = []
@@ -328,7 +336,7 @@ class MEPOL:
         table.extend([
             ["Epoch", epoch],
             ["Execution time (s)", fancy_float(execution_time)],
-            ["Entropy", fancy_float(entropy)],
+            ["Entropy", fancy_float(mean_entropy)],
             ["Cost", fancy_float(mean_cost)],
             ["Off-policy iters", num_off_iters]
         ])
@@ -346,7 +354,7 @@ class MEPOL:
         fancy_grid = tabulate(table, headers="firstrow", tablefmt="fancy_grid", numalign='right')
 
         # Log to csv file 1
-        csv_file_1.write(f"{epoch},{loss},{entropy},{mean_cost},{num_off_iters},{execution_time}\n")
+        csv_file_1.write(f"{epoch},{loss},{mean_entropy},{std_entropy},{mean_cost},{std_cost},{num_off_iters},{execution_time}\n")
         csv_file_1.flush()
 
         # Log to csv file 2
@@ -360,10 +368,10 @@ class MEPOL:
         log_file.flush()
         print(fancy_grid)
 
-    def log_off_iter_statistics(self, csv_file_3, epoch, global_off_iter,
-                                num_off_iter, entropy, kl, mean_cost, lr):
+    def log_off_iter_statistics(self, csv_file_3, epoch, num_off_iter, global_off_iter,
+                                mean_entropy, std_entropy, kl, mean_cost, std_cost, lr):
         # Log to csv file 3
-        csv_file_3.write(f"{epoch},{num_off_iter},{entropy},{kl},{mean_cost},{lr}\n")
+        csv_file_3.write(f"{epoch},{num_off_iter},{global_off_iter},{mean_entropy},{mean_entropy},{kl},{mean_cost},{std_cost},{lr}\n")
         csv_file_3.flush()
 
     def train(self):    
@@ -408,7 +416,7 @@ class MEPOL:
         log_file = open(os.path.join((self.out_path), 'log_file.txt'), 'a', encoding="utf-8")
 
         csv_file_1 = open(os.path.join(self.out_path, f"{self.env_id}.csv"), 'w')
-        csv_file_1.write(",".join(['epoch', 'loss', 'entropy', 'cost', 'num_off_iters','execution_time']))
+        csv_file_1.write(",".join(['epoch', 'loss', 'mean_entropy', 'std_entropy', 'mean_cost', 'std_cost', 'num_off_iters','execution_time']))
         csv_file_1.write("\n")
 
         if self.heatmap_discretizer is not None:
@@ -419,7 +427,7 @@ class MEPOL:
             csv_file_2 = None
 
         csv_file_3 = open(os.path.join(self.out_path, f"{self.env_id}_off_policy_iter.csv"), "w")
-        csv_file_3.write(",".join(['epoch', 'off_policy_iter', 'entropy', 'kl', 'learning_rate']))
+        csv_file_3.write(",".join(['epoch', 'off_policy_iter', 'global_off_policy_iter', 'mean_entropy', 'std_entropy', 'kl', 'mean_cost', 'learning_rate']))
         csv_file_3.write("\n")
 
         # Fixed constants
@@ -436,14 +444,15 @@ class MEPOL:
             self.collect_particles_and_compute_knn()
 
         with torch.inference_mode():
-            entropy = self.compute_entropy(self.behavioral_policy, self.behavioral_policy, states, 
+            mean_entropy, std_entropy = self.compute_entropy(self.behavioral_policy, self.behavioral_policy, states, 
                                            actions, distances, indices)        
 
         print("\nEntropy computed")
 
         execution_time = time.time() - t0
-        entropy = entropy.cpu().numpy()
-        loss = -entropy
+        mean_entropy = mean_entropy.cpu().numpy()
+        std_entropy = std_entropy.cpu().numpy()
+        loss = -mean_entropy
         mean_cost, std_cost = self.compute_discounted_cost(costs)
 
         # Heatmap
@@ -461,18 +470,20 @@ class MEPOL:
 
         # Log statistics for the initial policy
         self.log_epoch_statistics(
-                log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
-                epoch=epoch,
-                loss=loss,
-                entropy=entropy,
-                mean_cost=mean_cost,
-                execution_time=execution_time,
-                num_off_iters=0,
-                heatmap_image=heatmap_image,
-                heatmap_entropy=heatmap_entropy,
-                backtrack_iters=None,
-                backtrack_lr=None
-            )
+            log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
+            epoch=epoch,
+            loss=loss,
+            mean_entropy=mean_entropy,
+            std_entropy=std_entropy,
+            mean_cost=mean_cost,
+            std_cost=std_cost,
+            num_off_iters=0,
+            execution_time=execution_time,
+            heatmap_image=heatmap_image,
+            heatmap_entropy=heatmap_entropy,
+            backtrack_iters=None,
+            backtrack_lr=None
+        )
 
         # Main Loop
         global_num_off_iters = 0
@@ -506,9 +517,11 @@ class MEPOL:
             while not kl_threshold_reached:
                 print("\nOptimizing KL continues")
                 # Optimize policy      
-                loss, numeric_error = self.policy_update(self.policy_optimizer, self.behavioral_policy, self.target_policy, 
+                loss, numeric_error, mean_entropy, std_entropy = self.policy_update(self.policy_optimizer, self.behavioral_policy, self.target_policy, 
                                                          states, actions, distances, indices)
-                entropy = -loss.detach().cpu().numpy()
+                mean_entropy = mean_entropy.detach().cpu().numpy()
+                std_entropy = std_entropy.detach().cpu().numpy()
+                loss = loss.detach().cpu().numpy()
 
                 with torch.inference_mode():
                     kl, kl_numeric_error = self.compute_kl(self.behavioral_policy, self.target_policy, states, actions, indices)
@@ -524,8 +537,8 @@ class MEPOL:
                     global_num_off_iters += 1
                     lr = self.lambda_policy
                     # Log statistics for this off policy iteration
-                    self.log_off_iter_statistics(csv_file_3, epoch, global_num_off_iters,
-                                                 num_off_iters - 1, entropy, kl, mean_cost, lr)                
+                    self.log_off_iter_statistics(csv_file_3, epoch, num_off_iters - 1, global_num_off_iters - 1,
+                                                 mean_entropy, std_entropy, kl, mean_cost, std_cost, lr)                
 
                 else:
                     if self.use_backtracking:
@@ -557,10 +570,10 @@ class MEPOL:
                 if kl_threshold_reached:
                     # Compute entropy of new policy
                     with torch.inference_mode():
-                        entropy = self.compute_entropy(self.behavioral_policy, self.behavioral_policy, states, 
+                        mean_entropy, std_entropy = self.compute_entropy(self.behavioral_policy, self.behavioral_policy, states, 
                                                        actions, distances, indices)
 
-                    if torch.isnan(entropy) or torch.isinf(entropy):
+                    if torch.isnan(mean_entropy) or torch.isinf(mean_entropy):
                         print("Aborting because final entropy is nan or inf...")
                         print("There is most likely a problem in knn aliasing. Use a higher k.")
                         exit()
@@ -572,8 +585,9 @@ class MEPOL:
                         self.behavioral_policy.load_state_dict(last_valid_target_policy.state_dict())
                         self.target_policy.load_state_dict(last_valid_target_policy.state_dict())
 
-                        loss = -entropy.cpu().numpy()
-                        entropy = entropy.cpu().numpy()
+                        mean_entropy = mean_entropy.cpu().numpy()
+                        std_entropy = std_entropy.cpu().numpy()
+                        loss = -mean_entropy
                         mean_cost, std_cost = self.compute_discounted_cost(costs)
                         execution_time = time.time() - t0
 
@@ -605,10 +619,12 @@ class MEPOL:
                             log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
                             epoch=epoch,
                             loss=loss,
-                            entropy=entropy,
+                            mean_entropy=mean_entropy,
+                            std_entropy=std_entropy,
                             mean_cost=mean_cost,
-                            execution_time=execution_time,
+                            std_cost=std_cost,
                             num_off_iters=num_off_iters,
+                            execution_time=execution_time,
                             heatmap_image=heatmap_image,
                             heatmap_entropy=heatmap_entropy,
                             backtrack_iters=backtrack_iter,

@@ -48,6 +48,10 @@ obj.train()
 #           seed = 0, out_path = "results/testing")
 # obj.train()
 
+# obj = MEPOL(env_id = "MountainCarContinuous-v0", T = 8, N = 400, heatmap_cmap = 'Blues', 
+#             heatmap_labels = ('Position', 'Velocity'), heatmap_interp = 'spline16')
+# obj.plot_heatmap()
+
 # MEPOL(env_id = "CartPole-v1", k = 4, delta = 0.5, max_off_iters = 30,
 #           use_backtracking = 1, backtrack_coeff = 2, max_backtrack_try = 10, eps = 1e-5,
 #           lambda_policy = 1e-4, episode_nr = 8, step_nr = 300, epoch_nr = 300,
