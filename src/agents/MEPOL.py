@@ -74,6 +74,7 @@ class MEPOL:
         self.target_policy = None
         self.policy_optimizer = None
 
+
     def create_policy(self, is_behavioral=False):
 
         policy = PolicyNetwork(self.state_dim, self.action_dim, self.is_discrete, self.device).to(self.device)
@@ -82,6 +83,7 @@ class MEPOL:
             policy = train_supervised(self.envs, policy, self.lambda_policy, self.device, train_steps=100)
 
         return policy
+
 
     def collect_particles(self):
         """
@@ -235,6 +237,7 @@ class MEPOL:
 
         return states, actions, costs, next_states, distances, indices
 
+
     def policy_update(self, optimizer, behavioral_policy, target_policy, states, actions, distances, indices):
         optimizer.zero_grad()
 
@@ -248,6 +251,7 @@ class MEPOL:
         optimizer.step()
 
         return loss, numeric_error, mean_entropy, std_entropy
+
 
     def get_heatmap(self, title = None):
         """
@@ -328,6 +332,7 @@ class MEPOL:
 
         return average_state_dist, average_entropy, image_fig
 
+
     def log_epoch_statistics(self, log_file, csv_file_1, csv_file_2, epoch,
                             loss, mean_entropy, std_entropy, mean_cost, std_cost, num_off_iters, execution_time,
                             heatmap_image, heatmap_entropy, backtrack_iters, backtrack_lr):
@@ -369,11 +374,13 @@ class MEPOL:
         log_file.flush()
         print(fancy_grid)
 
+
     def log_off_iter_statistics(self, csv_file_3, epoch, num_off_iter, global_off_iter,
                                 mean_entropy, std_entropy, kl, mean_cost, std_cost, lr):
         # Log to csv file 3
         csv_file_3.write(f"{epoch},{num_off_iter},{global_off_iter},{mean_entropy},{mean_entropy},{kl},{mean_cost},{std_cost},{lr}\n")
         csv_file_3.flush()
+
 
     def train(self):    
         if torch.cuda.is_available():
@@ -494,7 +501,7 @@ class MEPOL:
         best_loss = loss
         best_epoch = 0
         patience_counter = 0
-        
+
         for epoch in range(1, self.epoch_nr + 1):
             print(f"Epoch {epoch} starts")
             t0 = time.time()
@@ -636,7 +643,6 @@ class MEPOL:
         if isinstance(self.envs, gymnasium.vector.VectorEnv):
             self.envs.close()
 
-        return self.behavioral_policy
 
     def plot_heatmap(self):    
         """

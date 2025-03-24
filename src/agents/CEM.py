@@ -85,6 +85,7 @@ class CEM:
         self.value_nn = None
         self.value_optimizer = None
 
+
     def create_policy(self, is_behavioral=False):
 
         policy = PolicyNetwork(self.state_dim, self.action_dim, self.is_discrete, self.device).to(self.device)
@@ -93,6 +94,7 @@ class CEM:
             policy = train_supervised(self.envs, policy, self.lambda_policy, self.device, train_steps=100)
 
         return policy
+
 
     def collect_particles(self, behavioral = True):
         """
@@ -289,6 +291,7 @@ class CEM:
 
         return loss, numeric_error, mean_entropy, std_entropy
 
+
     def get_heatmap(self, title = None):
         """
         Builds a log-probability state visitation heatmap by running
@@ -368,6 +371,7 @@ class CEM:
 
         return average_state_dist, average_entropy, image_fig
 
+
     def log_epoch_statistics(self, log_file, csv_file_1, csv_file_2, epoch,
                             value_loss, policy_loss, safety_weight, value_lr, 
                             advantage, mean_entropy, std_entropy, mean_cost, std_cost, num_off_iters, execution_time,
@@ -413,11 +417,13 @@ class CEM:
         log_file.flush()
         print(fancy_grid)
 
+
     def log_off_iter_statistics(self, csv_file_3, epoch, num_off_iter, global_off_iter,
                                 loss, advantage, mean_entropy, std_entropy, kl, mean_cost, std_cost, lr):
         # Log to csv file 3
         csv_file_3.write(f"{epoch},{num_off_iter},{global_off_iter},{loss},{advantage},{mean_entropy},{std_entropy},{kl},{mean_cost},{std_cost},{lr}\n")
         csv_file_3.flush()
+
 
     def train(self):    
         if torch.cuda.is_available():
@@ -718,7 +724,6 @@ class CEM:
         if isinstance(self.envs, gymnasium.vector.VectorEnv):
             self.envs.close()
 
-        return self.behavioral_policy
 
     def plot_heatmap(self):    
         """
