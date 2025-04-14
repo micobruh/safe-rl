@@ -24,10 +24,10 @@ torch.set_default_dtype(float_choice)
 
 class MEPOL:
     def __init__(self, env_id, episode_nr, step_nr, heatmap_cmap, heatmap_labels, heatmap_interp,
-                 int_type=int_choice, float_type=float_choice,
+                 parallel_envs=8, int_type=int_choice, float_type=float_choice,
                  k=1, delta=1, max_off_iters=1, use_backtracking=True, backtrack_coeff=0, 
                  max_backtrack_try=0, eps=1e-5, lambda_policy=1e-3, epoch_nr=500, 
-                 heatmap_every=20, seed=None, out_path=""):    
+                 seed=None, out_path=""):    
         """
         T: Number of trajectories/episodes
         N: Number of time steps
@@ -47,9 +47,9 @@ class MEPOL:
         self.eps = eps
         self.lambda_policy = lambda_policy
         self.episode_nr = episode_nr
+        self.parallel_envs = parallel_envs
         self.step_nr = step_nr
         self.epoch_nr = epoch_nr
-        self.heatmap_every = heatmap_every
         self.heatmap_cmap = heatmap_cmap
         self.heatmap_labels = heatmap_labels
         self.heatmap_interp = heatmap_interp
@@ -85,42 +85,47 @@ class MEPOL:
         return policy
 
 
-    def collect_particles(self):
+    def collect_particles(self, behavioral=True):
         """
-        Collects num_traj * traj_len samples in parallel across multiple environments.
+        Collects num_loops * parallel_envs episodes (particles) of trajectory data.
+        Each loop collects one batch of trajectories in parallel across multiple environments.
         """
         states = np.zeros((self.episode_nr, self.step_nr + 1, self.state_dim), dtype=np.float32)
         if self.is_discrete:
             actions = np.zeros((self.episode_nr, self.step_nr, self.action_dim), dtype=np.int32)
         else:
             actions = np.zeros((self.episode_nr, self.step_nr, self.action_dim), dtype=np.float32)
-        costs = np.zeros((self.episode_nr, self.step_nr, 1), dtype=np.float32)  # Cost is a scalar
+        costs = np.zeros((self.episode_nr, self.step_nr, 1), dtype=np.float32)
         next_states = np.zeros((self.episode_nr, self.step_nr, self.state_dim), dtype=np.float32)
 
-        # Reset all environments
-        s, _ = self.envs.reset()
-
         print("\nCollect particles")
-        for t in tqdm(range(self.step_nr)):
-            # Store state
-            states[:, t] = s
+        num_loops = self.episode_nr // self.parallel_envs
+        for loop_idx in range(num_loops):
+            # Reset the environments for this batch
+            s, _ = self.envs.reset()
 
-            # Sample action from policy
-            a = self.behavioral_policy.predict(s).cpu().numpy()  
-            actions[:, t] = a
+            loop_offset = loop_idx * self.parallel_envs  # where to store this batch
+            for t in tqdm(range(self.step_nr)):
+                # Sample action from policy
+                if behavioral:
+                    a = self.behavioral_policy.predict(s).cpu().numpy()
+                else:
+                    a = self.target_policy.predict(s).cpu().numpy()
 
-            if self.is_discrete:
-                a = a.squeeze(-1)      
+                if self.is_discrete:
+                    a = a.squeeze(-1)
 
-            # Apply action to all environments
-            s, _, cost, _, _, _ = self.envs.step(a)
+                # Record
+                states[loop_offset: loop_offset + self.parallel_envs, t] = s
+                actions[loop_offset: loop_offset + self.parallel_envs, t] = a
 
-            # Store cost and next state
-            costs[:, t] = cost.reshape(-1, 1)
-            next_states[:, t] = s
+                # Step through environments
+                s, _, cost, _, _, _ = self.envs.step(a)
+                costs[loop_offset: loop_offset + self.parallel_envs, t] = cost.reshape(-1, 1)
+                next_states[loop_offset: loop_offset + self.parallel_envs, t] = s
 
-        # Store final state
-        states[:, self.step_nr] = s
+            # Final state
+            states[loop_offset: loop_offset + self.parallel_envs, self.step_nr] = s
 
         return states, actions, costs, next_states
 
@@ -259,35 +264,30 @@ class MEPOL:
         the policy in env. The heatmap is built using the provided
         discretizer.
         """
-        num_envs = self.envs.num_envs  # Number of parallel environments
-
         # Initialize state visitation count
         average_state_dist = self.heatmap_discretizer.get_empty_mat()
         state_dist = np.zeros_like(average_state_dist)  # Track visits for this run
 
         print("\nGetting heatmap using vectorized environments...")
 
-        # Reset all environments (batched)
-        s, _ = self.envs.reset()
+        num_loops = self.episode_nr // self.parallel_envs
+        for _ in tqdm(range(num_loops)):
+            # Reset all environments (batched)
+            s, _ = self.envs.reset()            
+            for t in tqdm(range(self.step_nr)):
+                # Convert states to tensor and predict actions
+                with torch.inference_mode():
+                    a = self.behavioral_policy.predict(s).cpu().numpy()  # Move actions to CPU for envs.step()
 
-        for t in tqdm(range(self.step_nr)):
-            # Convert states to tensor and predict actions
-            with torch.inference_mode():
-                a = self.behavioral_policy.predict(s).cpu().numpy()  # Move actions to CPU for envs.step()
+                if self.is_discrete:
+                    a = a.squeeze(-1)
 
-            if self.is_discrete:
-                a = a.squeeze(-1)
+                # Step all environments at once
+                s, _, _, _, _, _ = self.envs.step(a)
 
-            # Step all environments at once
-            s, _, _, _, _, _ = self.envs.step(a)
-
-            # Discretize and count visited states for each environment
-            for i in range(num_envs):
-                state_dist[self.heatmap_discretizer.discretize(s[i])] += 1
-
-            # # Reset finished environments while keeping ongoing ones
-            # if np.any(dones):
-            #     s, _ = self.envs.reset_done()
+                # Discretize and count visited states for each environment
+                for i in range(self.parallel_envs):
+                    state_dist[self.heatmap_discretizer.discretize(s[i])] += 1
 
         # Normalize state visitation
         state_dist /= self.step_nr
@@ -314,7 +314,7 @@ class MEPOL:
             plt.bar([i for i in range(self.heatmap_discretizer.bins_sizes[0])], average_state_dist)
         
         # Safety constraint position in real world coordinates
-        safety_x_position = -0.5  # The x-value where the vertical line should be
+        safety_x_position = -0.6  # The x-value where the vertical line should be
 
         # Get x-axis bin edges from the discretizer
         x_bin_edges = self.heatmap_discretizer.bins[0]  # Assuming first dimension corresponds to x
@@ -391,9 +391,9 @@ class MEPOL:
             print("\nThere is no GPU")
         self.device = torch.device(dev)    
 
-        self.envs = create_envs(self.env_id, self.step_nr, self.episode_nr)
+        self.envs = create_envs(self.env_id, self.step_nr, self.parallel_envs)
         self.heatmap_discretizer = create_discretizer(self.envs)
-        self.num_workers = min(os.cpu_count(), self.episode_nr)
+        self.num_workers = min(os.cpu_count(), self.parallel_envs)
         # # Seed everything
         # if seed is not None:
         #     # Seed everything
@@ -473,7 +473,7 @@ class MEPOL:
             heatmap_image = None
 
         # Save initial policy
-        torch.save(self.behavioral_policy.state_dict(), os.path.join(self.out_path, "0-policy"))
+        torch.save(self.behavioral_policy.state_dict(), os.path.join(self.out_path, "0-policy.pt"))
 
         # Log statistics for the initial policy
         self.log_epoch_statistics(
@@ -620,7 +620,7 @@ class MEPOL:
 
                 if loss < best_loss:
                     # Save policy
-                    torch.save(self.behavioral_policy.state_dict(), os.path.join(self.out_path, f"{epoch}-policy"))
+                    torch.save(self.behavioral_policy.state_dict(), os.path.join(self.out_path, f"{epoch}-policy.pt"))
                     patience_counter = 0
                     best_epoch = epoch
                 else:
@@ -630,7 +630,7 @@ class MEPOL:
 
         # Heatmap
         if self.heatmap_discretizer is not None:
-            model_link = os.path.join(self.out_path, f"{best_epoch}-policy")
+            model_link = os.path.join(self.out_path, f"{best_epoch}-policy.pt")
             self.behavioral_policy.load_state_dict(torch.load(model_link))
             _, heatmap_entropy, heatmap_image = \
                 self.get_heatmap()
@@ -668,7 +668,7 @@ class MEPOL:
         else:
             self.action_dim = self.envs.single_action_space.shape[0]
 
-        model_lst = ["./results/MountainCarContinuous/MEPOL/0-policy", "./results/MountainCarContinuous/MEPOL/299-policy"]
+        model_lst = ["./results/MountainCarContinuous/MEPOL/0-policy.pt", "./results/MountainCarContinuous/MEPOL/299-policy.pt"]
         title_lst = ["Initial", "Final"]
 
         for model_link, title_txt in zip(model_lst, title_lst):
