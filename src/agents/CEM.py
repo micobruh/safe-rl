@@ -31,7 +31,7 @@ class CEM:
                  parallel_envs=8, int_type=int_choice, float_type=float_choice,
                  k=1, delta=1, max_off_iters=1, use_backtracking=True, backtrack_coeff=0, 
                  max_backtrack_try=0, eps=1e-5, d=1, lambda_policy=1e-3, lambda_value=1e-3, 
-                 lambda_omega=1e-3, epoch_nr=500, seed=None, out_path=""):    
+                 lambda_omega=1e-3, epoch_nr=500, is_renyi=False, seed=None, out_path=""):    
         """
         T: Number of trajectories/episodes
         N: Number of time steps
@@ -76,8 +76,9 @@ class CEM:
         self.B = 0
         self.G = 0   
         self.gamma = 0.99
-        self.omega = 5000
+        self.omega = 3000
         self.patience = 50
+        self.is_renyi = is_renyi
 
         self.behavioral_policy = None
         self.target_policy = None
@@ -171,19 +172,20 @@ class CEM:
     def compute_entropy(self, behavioral_policy, target_policy, states, actions,
                         distances, indices):
         importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
-        # Compute objective function
-        # Compute weights sum for each particle        
         weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim = 1)
-        # Compute volume for each particle
         volumes = (torch.pow(distances[:, self.k], self.state_dim) *
                 torch.pow(torch.tensor(np.pi), self.state_dim / 2)) / self.G
 
-        # Compute entropy
-        entropy_terms = -(weights_sum / self.k) * torch.log((weights_sum / (volumes + self.eps)) + self.eps)
-        entropy_terms_per_episode = entropy_terms.view(self.episode_nr, self.step_nr)
-        entropy_per_episode = torch.sum(entropy_terms_per_episode, dim = 1) + self.B
+        if self.is_renyi:
+            renyi_order = 2.0
+            density_estimate = weights_sum / (volumes + self.eps)
+            renyi_entropy = 1.0 / (1.0 - renyi_order) * torch.log(torch.sum(torch.pow(density_estimate, renyi_order)) + self.eps)
+            entropy_per_episode = renyi_entropy.view(1)
+        else:
+            entropy_terms = -(weights_sum / self.k) * torch.log((weights_sum / (volumes + self.eps)) + self.eps)
+            entropy_terms_per_episode = entropy_terms.view(self.episode_nr, self.step_nr)
+            entropy_per_episode = torch.sum(entropy_terms_per_episode, dim = 1) + self.B
 
-        # Final values
         mean_entropy = torch.mean(entropy_per_episode)
         std_entropy = torch.std(entropy_per_episode, unbiased=False)
 
