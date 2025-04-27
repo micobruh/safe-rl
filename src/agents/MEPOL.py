@@ -1,10 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import gymnasium
-import safety_gymnasium
-from tqdm import tqdm, trange
+from tqdm import tqdm
 import time
 from sklearn.neighbors import NearestNeighbors
 import scipy
@@ -12,9 +10,7 @@ import scipy.special
 from src.init_env import create_envs
 from src.policy import PolicyNetwork, train_supervised
 from tabulate import tabulate
-import matplotlib
 import matplotlib.pyplot as plt
-from torch.utils import tensorboard
 import os
 from src.discretizer import create_discretizer
 
@@ -36,8 +32,16 @@ class MEPOL:
         lambda: Learning rate
         k: Number of neighbors
         gamma: Discount factor of cost over time
-        """        
+        """   
+        # == Environment Config ==
         self.env_id = env_id
+        self.parallel_envs = parallel_envs
+        self.seed = seed
+        self.out_path = out_path
+        self.int_type = int_type
+        self.float_type = float_type
+
+        # == Algorithm Hyperparameters ==
         self.k = k
         self.delta = delta
         self.max_off_iters = max_off_iters
@@ -47,43 +51,41 @@ class MEPOL:
         self.eps = eps
         self.lambda_policy = lambda_policy
         self.episode_nr = episode_nr
-        self.parallel_envs = parallel_envs
         self.step_nr = step_nr
         self.epoch_nr = epoch_nr
-        self.heatmap_cmap = heatmap_cmap
-        self.heatmap_labels = heatmap_labels
-        self.heatmap_interp = heatmap_interp
-        self.seed = seed
-        self.out_path = out_path
-
-        self.int_type = int_type
-        self.float_type = float_type
-        self.device = None
-        self.envs = None
-        self.is_discrete = False
-        self.state_dim = 0
-        self.action_dim = 0
-        self.heatmap_discretizer = None
-        self.num_workers = 1     
-        self.B = 0
-        self.G = 0   
         self.gamma = 0.99
         self.patience = 50
 
+        # == Environment State ==  
+        self.envs = None  
+        self.device = None
+        self.is_discrete = False
+        self.state_dim = 0
+        self.action_dim = 0
+        self.num_workers = 1     
+        self.B = 0
+        self.G = 0               
+
+        # == Neural Networks ==
         self.behavioral_policy = None
         self.target_policy = None
         self.policy_optimizer = None
 
+        # == Heatmap Settings ==
+        self.heatmap_cmap = heatmap_cmap
+        self.heatmap_labels = heatmap_labels
+        self.heatmap_interp = heatmap_interp
+        self.heatmap_discretizer = None
 
+
+    # Environment and Setup
     def create_policy(self, is_behavioral=False):
-
         policy = PolicyNetwork(self.state_dim, self.action_dim, self.is_discrete, self.device).to(self.device)
 
         if is_behavioral:
             policy = train_supervised(self.envs, policy, self.lambda_policy, self.device, train_steps=100)
 
         return policy
-
 
     def collect_particles(self, behavioral=True):
         """
@@ -129,94 +131,6 @@ class MEPOL:
 
         return states, actions, costs, next_states
 
-
-    def compute_importance_weights(self, behavioral_policy, target_policy, states, actions):
-        # Initialize to None for the first concat
-        importance_weights = None
-
-        # Compute the importance weights
-        # build iw vector incrementally from trajectory particles
-        print("\nCompute importance weights")
-        for episode in tqdm(range(self.episode_nr)):
-            # Last state (terminal) is discarded to match the action length
-            traj_states = states[episode, : -1]
-            traj_actions = actions[episode]
-
-            traj_target_log_p = target_policy.get_log_p(traj_states, traj_actions)
-            traj_behavior_log_p = behavioral_policy.get_log_p(traj_states, traj_actions)
-
-            traj_particle_iw = torch.exp(torch.cumsum(traj_target_log_p - traj_behavior_log_p, dim = 0))
-
-            if importance_weights is None:
-                importance_weights = traj_particle_iw
-            else:
-                importance_weights = torch.cat([importance_weights, traj_particle_iw], dim=0)
-
-        # Normalize the weights
-        importance_weights /= torch.sum(importance_weights)
-        return importance_weights
-
-
-    def compute_entropy(self, behavioral_policy, target_policy, states, actions,
-                        distances, indices):
-        importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
-        # Compute objective function
-        # Compute weights sum for each particle        
-        weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim = 1)
-        # Compute volume for each particle
-        volumes = (torch.pow(distances[:, self.k], self.state_dim) *
-                torch.pow(torch.tensor(np.pi), self.state_dim / 2)) / self.G
-
-        # Compute entropy
-        entropy_terms = -(weights_sum / self.k) * torch.log((weights_sum / (volumes + self.eps)) + self.eps)
-        entropy_terms_per_episode = entropy_terms.view(self.episode_nr, self.step_nr)
-        entropy_per_episode = torch.sum(entropy_terms_per_episode, dim = 1) + self.B
-
-        # Final values
-        mean_entropy = torch.mean(entropy_per_episode)
-        std_entropy = torch.std(entropy_per_episode, unbiased=False)
-
-        if self.is_discrete:
-            entropy_bonus_weight = 0.01
-            mean_entropy += entropy_bonus_weight * mean_entropy
-
-        return mean_entropy, std_entropy
-
-
-    def compute_discounted_cost(self, costs):
-        """
-        Computes the discounted sum of costs over timesteps for each trajectory.
-        """
-        # Create discount factors tensor of shape (traj_len, 1)
-        discount_factors = (self.gamma ** torch.arange(self.step_nr, device=self.device)).view(1, self.step_nr, 1)
-
-        # Compute discounted sum along timesteps (axis=1)
-        discounted_costs = torch.sum(costs * discount_factors, dim=1)  # Shape (num_traj, 1)
-
-        # Compute mean and variance across trajectories & move result to CPU
-        mean_cost = discounted_costs.mean().cpu()
-        sd_cost = discounted_costs.std().cpu()
-
-        return mean_cost, sd_cost
-
-
-    def compute_kl(self, behavioral_policy, target_policy, states, actions, indices):
-        importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
-
-        weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim = 1)
-
-        # Compute KL divergence between behavioral and target policy
-        kl = (1 / self.episode_nr / self.step_nr) * torch.sum(torch.log(self.k / (self.episode_nr * self.step_nr * weights_sum) + self.eps))
-
-        numeric_error = torch.isinf(kl) or torch.isnan(kl)
-
-        # Minimum KL is zero
-        # NOTE: do not remove epsilon factor
-        kl = torch.max(torch.tensor(0.0), kl)
-
-        return kl, numeric_error
-    
-
     def collect_particles_and_compute_knn(self):
         # Run simulations
         states, actions, costs, next_states = self.collect_particles()
@@ -241,22 +155,6 @@ class MEPOL:
         indices = torch.tensor(indices, dtype=self.int_type, device=self.device)
 
         return states, actions, costs, next_states, distances, indices
-
-
-    def policy_update(self, optimizer, behavioral_policy, target_policy, states, actions, distances, indices):
-        optimizer.zero_grad()
-
-        # Maximize entropy
-        mean_entropy, std_entropy = self.compute_entropy(behavioral_policy, target_policy, states, actions, distances, indices)
-        loss = -mean_entropy
-
-        numeric_error = torch.isinf(loss) or torch.isnan(loss)
-
-        loss.backward()
-        optimizer.step()
-
-        return loss, numeric_error, mean_entropy, std_entropy
-
 
     def get_heatmap(self, title = None):
         """
@@ -331,11 +229,111 @@ class MEPOL:
             plt.title(title)
 
         return average_state_dist, average_entropy, image_fig
+        
+
+    # Optimization and Evaluation
+    def compute_importance_weights(self, behavioral_policy, target_policy, states, actions):
+        # Initialize to None for the first concat
+        importance_weights = None
+
+        # Compute the importance weights
+        # build iw vector incrementally from trajectory particles
+        print("\nCompute importance weights")
+        for episode in tqdm(range(self.episode_nr)):
+            # Last state (terminal) is discarded to match the action length
+            traj_states = states[episode, : -1]
+            traj_actions = actions[episode]
+
+            traj_target_log_p = target_policy.get_log_p(traj_states, traj_actions)
+            traj_behavior_log_p = behavioral_policy.get_log_p(traj_states, traj_actions)
+
+            traj_particle_iw = torch.exp(torch.cumsum(traj_target_log_p - traj_behavior_log_p, dim = 0))
+
+            if importance_weights is None:
+                importance_weights = traj_particle_iw
+            else:
+                importance_weights = torch.cat([importance_weights, traj_particle_iw], dim=0)
+
+        # Normalize the weights
+        importance_weights /= torch.sum(importance_weights)
+        return importance_weights
+
+    def compute_entropy(self, behavioral_policy, target_policy, states, actions,
+                        distances, indices):
+        importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
+        # Compute objective function
+        # Compute weights sum for each particle        
+        weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim = 1)
+        # Compute volume for each particle
+        volumes = (torch.pow(distances[:, self.k], self.state_dim) *
+                torch.pow(torch.tensor(np.pi), self.state_dim / 2)) / self.G
+
+        # Compute entropy
+        entropy_terms = -(weights_sum / self.k) * torch.log((weights_sum / (volumes + self.eps)) + self.eps)
+        entropy_terms_per_episode = entropy_terms.view(self.episode_nr, self.step_nr)
+        entropy_per_episode = torch.sum(entropy_terms_per_episode, dim = 1) + self.B
+
+        # Final values
+        mean_entropy = torch.mean(entropy_per_episode)
+        std_entropy = torch.std(entropy_per_episode, unbiased=False)
+
+        if self.is_discrete:
+            entropy_bonus_weight = 0.01
+            mean_entropy += entropy_bonus_weight * mean_entropy
+
+        return mean_entropy, std_entropy
+
+    def compute_discounted_cost(self, costs):
+        """
+        Computes the discounted sum of costs over timesteps for each trajectory.
+        """
+        # Create discount factors tensor of shape (traj_len, 1)
+        discount_factors = (self.gamma ** torch.arange(self.step_nr, device=self.device)).view(1, self.step_nr, 1)
+
+        # Compute discounted sum along timesteps (axis=1)
+        discounted_costs = torch.sum(costs * discount_factors, dim=1)  # Shape (num_traj, 1)
+
+        # Compute mean and variance across trajectories & move result to CPU
+        mean_cost = discounted_costs.mean().cpu()
+        sd_cost = discounted_costs.std().cpu()
+
+        return mean_cost, sd_cost
+
+    def compute_kl(self, behavioral_policy, target_policy, states, actions, indices):
+        importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
+
+        weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim = 1)
+
+        # Compute KL divergence between behavioral and target policy
+        kl = (1 / self.episode_nr / self.step_nr) * torch.sum(torch.log(self.k / (self.episode_nr * self.step_nr * weights_sum) + self.eps))
+
+        numeric_error = torch.isinf(kl) or torch.isnan(kl)
+
+        # Minimum KL is zero
+        # NOTE: do not remove epsilon factor
+        kl = torch.max(torch.tensor(0.0), kl)
+
+        return kl, numeric_error
+
+    def policy_update(self, optimizer, behavioral_policy, target_policy, states, actions, distances, indices):
+        optimizer.zero_grad()
+
+        # Maximize entropy
+        mean_entropy, std_entropy = self.compute_entropy(behavioral_policy, target_policy, states, actions, distances, indices)
+        loss = -mean_entropy
+
+        numeric_error = torch.isinf(loss) or torch.isnan(loss)
+
+        loss.backward()
+        optimizer.step()
+
+        return loss, numeric_error, mean_entropy, std_entropy
 
 
+    # Logging
     def log_epoch_statistics(self, log_file, csv_file_1, csv_file_2, epoch,
-                            loss, mean_entropy, std_entropy, mean_cost, std_cost, num_off_iters, execution_time,
-                            heatmap_image, heatmap_entropy, backtrack_iters, backtrack_lr):
+                             policy_loss, mean_entropy, std_entropy, mean_cost, std_cost, num_off_iters, execution_time,
+                             heatmap_image, heatmap_entropy, backtrack_iters, backtrack_lr):
         # Prepare tabulate table
         table = []
         fancy_float = lambda f : f"{f:.3f}"
@@ -360,7 +358,7 @@ class MEPOL:
         fancy_grid = tabulate(table, headers="firstrow", tablefmt="fancy_grid", numalign='right')
 
         # Log to csv file 1
-        csv_file_1.write(f"{epoch},{loss},{mean_entropy},{std_entropy},{mean_cost},{std_cost},{num_off_iters},{execution_time}\n")
+        csv_file_1.write(f"{epoch},{policy_loss},{mean_entropy},{std_entropy},{mean_cost},{std_cost},{num_off_iters},{execution_time}\n")
         csv_file_1.flush()
 
         # Log to csv file 2
@@ -374,23 +372,22 @@ class MEPOL:
         log_file.flush()
         print(fancy_grid)
 
-
     def log_off_iter_statistics(self, csv_file_3, epoch, num_off_iter, global_off_iter,
                                 mean_entropy, std_entropy, kl, mean_cost, std_cost, lr):
         # Log to csv file 3
         csv_file_3.write(f"{epoch},{num_off_iter},{global_off_iter},{mean_entropy},{mean_entropy},{kl},{mean_cost},{std_cost},{lr}\n")
         csv_file_3.flush()
 
-
-    def train(self):    
+    # Main Training
+    def _initialize_device(self):
         if torch.cuda.is_available():
-            dev = "cuda:0"
-            print("\nThere is GPU")
+            self.device = torch.device("cuda:0")
+            print("\nUsing GPU")
         else:
-            dev = "cpu"
-            print("\nThere is no GPU")
-        self.device = torch.device(dev)    
+            self.device = torch.device("cpu")
+            print("\nUsing CPU")
 
+    def _initialize_envs(self):
         self.envs = create_envs(self.env_id, self.step_nr, self.parallel_envs)
         self.heatmap_discretizer = create_discretizer(self.envs)
         self.num_workers = min(os.cpu_count(), self.parallel_envs)
@@ -399,16 +396,21 @@ class MEPOL:
         #     # Seed everything
         #     np.random.seed(self.seed)
         #     torch.manual_seed(self.seed)
-        #     envs.seed(self.seed)
-
-        # Initialize policy neural network (theta)
+        #     envs.seed(self.seed)  
+        
         self.is_discrete = isinstance(self.envs.single_action_space, gymnasium.spaces.Discrete)
         self.state_dim = self.envs.single_observation_space.shape[0]
         if self.is_discrete:
             self.action_dim = 1
         else:
-            self.action_dim = self.envs.single_action_space.shape[0]
+            self.action_dim = self.envs.single_action_space.shape[0]        
+        
+        # Fix constants
+        self.B = np.log(self.k) - scipy.special.digamma(self.k)
+        self.G = scipy.special.gamma(self.state_dim / 2 + 1)  
 
+    def _initialize_networks(self):
+        # Initialize policy neural network
         # Create a behavioral, a target policy and a tmp policy used to save valid target policies
         # (those with kl <= kl_threshold) during off policy opt
         self.behavioral_policy = self.create_policy(is_behavioral=True)
@@ -420,6 +422,9 @@ class MEPOL:
         # Set optimizer for policy
         self.policy_optimizer = torch.optim.Adam(self.target_policy.parameters(), lr = self.lambda_policy)
 
+        return last_valid_target_policy       
+
+    def _initialize_logging(self):
         # Create log files
         log_file = open(os.path.join((self.out_path), 'log_file.txt'), 'a', encoding="utf-8")
 
@@ -438,10 +443,26 @@ class MEPOL:
         csv_file_3.write(",".join(['epoch', 'off_policy_iter', 'global_off_policy_iter', 'mean_entropy', 'std_entropy', 'kl', 'mean_cost', 'learning_rate']))
         csv_file_3.write("\n")
 
-        # Fixed constants
-        self.B = np.log(self.k) - scipy.special.digamma(self.k)
-        self.G = scipy.special.gamma(self.state_dim / 2 + 1)
+        return log_file, csv_file_1, csv_file_2, csv_file_3
 
+    def _plot_heatmap(self, best_epoch):
+        # Heatmap
+        if self.heatmap_discretizer is not None:
+            heatmap_ver = "initial"
+            if best_epoch != 0:
+                model_link = os.path.join(self.out_path, f"{best_epoch}-policy.pt")
+                self.behavioral_policy.load_state_dict(torch.load(model_link))
+                heatmap_ver = "final"
+            _, heatmap_entropy, heatmap_image = \
+                self.get_heatmap()
+            heatmap_image.savefig(f"{self.out_path}/{heatmap_ver}_heatmap.png")
+            plt.close(heatmap_image)    
+        else:
+            heatmap_entropy = None
+            heatmap_image = None   
+        return heatmap_entropy, heatmap_image
+
+    def _run_initial_evaluation(self, log_file, csv_file_1, csv_file_2):
         # At epoch 0 do not optimize, just log stuff for the initial policy
         print(f"\nInitial epoch starts")
         t0 = time.time()
@@ -452,25 +473,19 @@ class MEPOL:
 
         with torch.inference_mode():
             mean_entropy, std_entropy = self.compute_entropy(self.behavioral_policy, self.behavioral_policy, states, 
-                                           actions, distances, indices)        
+                                           actions, distances, indices)   
+            policy_loss = -mean_entropy             
 
         print("\nEntropy computed")
 
         execution_time = time.time() - t0
         mean_entropy = mean_entropy.cpu().numpy()
         std_entropy = std_entropy.cpu().numpy()
-        loss = -mean_entropy
         mean_cost, std_cost = self.compute_discounted_cost(costs)
+        policy_loss = policy_loss.cpu().numpy()
 
         # Heatmap
-        if self.heatmap_discretizer is not None:
-            _, heatmap_entropy, heatmap_image = \
-                self.get_heatmap()
-            heatmap_image.savefig(f"{self.out_path}/initial_heatmap.png")
-            plt.close(heatmap_image)
-        else:
-            heatmap_entropy = None
-            heatmap_image = None
+        heatmap_entropy, heatmap_image = self._plot_heatmap(0)
 
         # Save initial policy
         torch.save(self.behavioral_policy.state_dict(), os.path.join(self.out_path, "0-policy.pt"))
@@ -479,7 +494,7 @@ class MEPOL:
         self.log_epoch_statistics(
             log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
             epoch=0,
-            loss=loss,
+            policy_loss=policy_loss,
             mean_entropy=mean_entropy,
             std_entropy=std_entropy,
             mean_cost=mean_cost,
@@ -492,22 +507,81 @@ class MEPOL:
             backtrack_lr=None
         )
 
-        # Main Loop
-        global_num_off_iters = 0
+        return policy_loss, heatmap_entropy, heatmap_image
 
+    def _optimize_kl(self, states, actions, costs, distances, indices, original_lr, 
+                     last_valid_target_policy, backtrack_iter, csv_file_3, epoch, num_off_iters, 
+                     global_num_off_iters, mean_behavorial_costs, std_behavorial_costs):
+        
+        kl_threshold_reached = False
+
+        while not kl_threshold_reached:
+            print("\nOptimizing KL continues")             
+            # Update target policy network    
+            loss, numeric_error, mean_entropy, std_entropy = self.policy_update(self.policy_optimizer, self.behavioral_policy, 
+                                                                    self.target_policy, states, actions, distances, indices)
+            mean_entropy = mean_entropy.detach().cpu().numpy()
+            std_entropy = std_entropy.detach().cpu().numpy()
+            loss = loss.detach().cpu().numpy()
+
+            with torch.inference_mode():
+                kl, kl_numeric_error = self.compute_kl(self.behavioral_policy, self.target_policy, states, actions, indices)
+
+            kl = kl.cpu().numpy()
+
+            if not numeric_error and not kl_numeric_error and kl <= self.delta:
+                # Valid update
+                last_valid_target_policy.load_state_dict(self.target_policy.state_dict())
+                num_off_iters += 1
+                global_num_off_iters += 1
+                lr = self.lambda_policy
+                # Log statistics for this off policy iteration
+                self.log_off_iter_statistics(csv_file_3, epoch, num_off_iters - 1, global_num_off_iters - 1,
+                                             mean_entropy, std_entropy, kl, mean_behavorial_costs, std_behavorial_costs, lr)                
+
+            else:
+                if self.use_backtracking:
+                    # We are here either because we could not perform any update for this epoch
+                    # or because we need to perform one last update
+                    if not backtrack_iter == self.max_backtrack_try:
+                        self.target_policy.load_state_dict(last_valid_target_policy.state_dict())
+
+                        self.lambda_policy = original_lr / (self.backtrack_coeff ** backtrack_iter)
+
+                        for param_group in self.policy_optimizer.param_groups:
+                            param_group['lr'] = self.lambda_policy
+
+                        backtrack_iter += 1
+                        continue
+
+                # Do not accept the update, set exit condition to end the epoch
+                kl_threshold_reached = True
+
+            if self.use_backtracking and backtrack_iter > 1:
+                # Just perform at most 1 step using backtracking
+                kl_threshold_reached = True
+
+            if num_off_iters == self.max_off_iters:
+                # Set exit condition also if the maximum number
+                # of off policy opt iterations has been reached
+                kl_threshold_reached = True 
+
+        return backtrack_iter, num_off_iters, global_num_off_iters
+    
+    def _epoch_train(self, policy_loss, last_valid_target_policy, log_file, csv_file_1, csv_file_2, csv_file_3, heatmap_entropy, heatmap_image):
         if self.use_backtracking:
             original_lr = self.lambda_policy
 
-        best_loss = loss
+        best_loss = policy_loss
         best_epoch = 0
         patience_counter = 0
+        global_num_off_iters = 0
 
         for epoch in range(1, self.epoch_nr + 1):
             print(f"Epoch {epoch} starts")
             t0 = time.time()
 
             # Off policy optimization
-            kl_threshold_reached = False
             last_valid_target_policy.load_state_dict(self.behavioral_policy.state_dict())
             num_off_iters = 0
 
@@ -525,61 +599,12 @@ class MEPOL:
             else:
                 backtrack_iter = None
 
-            while not kl_threshold_reached:
-                print("\nOptimizing KL continues")
-                # Optimize policy      
-                loss, numeric_error, mean_entropy, std_entropy = self.policy_update(self.policy_optimizer, self.behavioral_policy, self.target_policy, 
-                                                         states, actions, distances, indices)
-                mean_entropy = mean_entropy.detach().cpu().numpy()
-                std_entropy = std_entropy.detach().cpu().numpy()
-                loss = loss.detach().cpu().numpy()
+            mean_behavorial_costs, std_behavorial_costs = self.compute_discounted_cost(costs)
 
-                with torch.inference_mode():
-                    kl, kl_numeric_error = self.compute_kl(self.behavioral_policy, self.target_policy, states, actions, indices)
-
-                kl = kl.cpu().numpy()
-
-                mean_cost, std_cost = self.compute_discounted_cost(costs)
-
-                if not numeric_error and not kl_numeric_error and kl <= self.delta:
-                    # Valid update
-                    last_valid_target_policy.load_state_dict(self.target_policy.state_dict())
-                    num_off_iters += 1
-                    global_num_off_iters += 1
-                    lr = self.lambda_policy
-                    # Log statistics for this off policy iteration
-                    self.log_off_iter_statistics(csv_file_3, epoch, num_off_iters - 1, global_num_off_iters - 1,
-                                                 mean_entropy, std_entropy, kl, mean_cost, std_cost, lr)                
-
-                else:
-                    if self.use_backtracking:
-                        # We are here either because we could not perform any update for this epoch
-                        # or because we need to perform one last update
-                        if not backtrack_iter == self.max_backtrack_try:
-                            self.target_policy.load_state_dict(last_valid_target_policy.state_dict())
-
-                            self.lambda_policy = original_lr / (self.backtrack_coeff ** backtrack_iter)
-
-                            for param_group in self.policy_optimizer.param_groups:
-                                param_group['lr'] = self.lambda_policy
-
-                            backtrack_iter += 1
-                            continue
-
-                    # Do not accept the update, set exit condition to end the epoch
-                    kl_threshold_reached = True
-
-                if self.use_backtracking and backtrack_iter > 1:
-                    # Just perform at most 1 step using backtracking
-                    kl_threshold_reached = True
-
-                if num_off_iters == self.max_off_iters:
-                    # Set exit condition also if the maximum number
-                    # of off policy opt iterations has been reached
-                    kl_threshold_reached = True
+            backtrack_iter, num_off_iters, global_num_off_iters = self._optimize_kl(states, actions, costs, distances, indices, original_lr, last_valid_target_policy, backtrack_iter, csv_file_3, epoch, num_off_iters, global_num_off_iters, mean_behavorial_costs, std_behavorial_costs)
 
             # Compute entropy of new policy
-            with torch.inference_mode():
+            with torch.inference_mode():                   
                 mean_entropy, std_entropy = self.compute_entropy(self.behavioral_policy, self.behavioral_policy, states, 
                                                 actions, distances, indices)
 
@@ -593,19 +618,17 @@ class MEPOL:
                 self.behavioral_policy.load_state_dict(last_valid_target_policy.state_dict())
                 self.target_policy.load_state_dict(last_valid_target_policy.state_dict())
 
+                loss = -mean_entropy.cpu().numpy()
                 mean_entropy = mean_entropy.cpu().numpy()
                 std_entropy = std_entropy.cpu().numpy()
-                loss = -mean_entropy
                 mean_cost, std_cost = self.compute_discounted_cost(costs)
                 execution_time = time.time() - t0
 
-
-                backtrack_lr = self.lambda_policy
-                # Log statistics for this epoch
+                # Log statistics for the initial policy
                 self.log_epoch_statistics(
                     log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
                     epoch=epoch,
-                    loss=loss,
+                    policy_loss=loss,
                     mean_entropy=mean_entropy,
                     std_entropy=std_entropy,
                     mean_cost=mean_cost,
@@ -614,9 +637,9 @@ class MEPOL:
                     execution_time=execution_time,
                     heatmap_image=heatmap_image,
                     heatmap_entropy=heatmap_entropy,
-                    backtrack_iters=backtrack_iter,
-                    backtrack_lr=backtrack_lr
-                )
+                    backtrack_iters=None,
+                    backtrack_lr=None
+                )    
 
                 if loss < best_loss:
                     # Save policy
@@ -626,19 +649,20 @@ class MEPOL:
                 else:
                     patience_counter += 1
                     if patience_counter == self.patience:
-                        break
+                        break  
 
-        # Heatmap
-        if self.heatmap_discretizer is not None:
-            model_link = os.path.join(self.out_path, f"{best_epoch}-policy.pt")
-            self.behavioral_policy.load_state_dict(torch.load(model_link))
-            _, heatmap_entropy, heatmap_image = \
-                self.get_heatmap()
-            heatmap_image.savefig(f"{self.out_path}/final_heatmap.png")
-            plt.close(heatmap_image)    
-        else:
-            heatmap_entropy = None
-            heatmap_image = None
+        return best_epoch
+
+    def train(self):    
+        self._initialize_device()
+        self._initialize_envs()
+        last_valid_target_policy = self._initialize_networks()
+        log_file, csv_file_1, csv_file_2, csv_file_3 = self._initialize_logging()
+
+        policy_loss, heatmap_entropy, heatmap_image = self._run_initial_evaluation(log_file, csv_file_1, csv_file_2)
+
+        best_epoch = self._epoch_train(policy_loss, last_valid_target_policy, log_file, csv_file_1, csv_file_2, csv_file_3, heatmap_entropy, heatmap_image)                                                                
+        heatmap_entropy, heatmap_image = self._plot_heatmap(best_epoch)
 
         if isinstance(self.envs, gymnasium.vector.VectorEnv):
             self.envs.close()
@@ -649,24 +673,8 @@ class MEPOL:
         T: Number of trajectories/episodes
         N: Number of time steps
         """
-        if torch.cuda.is_available():
-            dev = "cuda:0"
-            print("\nThere is GPU")
-        else:
-            dev = "cpu"
-            print("\nThere is no GPU")
-        self.device = torch.device(dev)    
-
-        self.envs = create_envs()
-        self.heatmap_discretizer = create_discretizer(self.envs)
-
-        # Initialize policy neural network (theta)
-        self.is_discrete = isinstance(self.envs.single_action_space, gymnasium.spaces.Discrete)
-        self.state_dim = self.envs.single_observation_space.shape[0]
-        if self.is_discrete:
-            self.action_dim = 1
-        else:
-            self.action_dim = self.envs.single_action_space.shape[0]
+        self._initialize_device()
+        self._initialize_envs()
 
         model_lst = ["./results/MountainCarContinuous/MEPOL/0-policy.pt", "./results/MountainCarContinuous/MEPOL/299-policy.pt"]
         title_lst = ["Initial", "Final"]
