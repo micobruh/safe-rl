@@ -15,24 +15,25 @@ import os
 from src.discretizer import create_discretizer
 from src.policy import PolicyNetwork, train_supervised
 from src.value import ValueNetwork
+from src.vae import VAE, Encoder, Decoder, Prior
 
 int_choice = torch.int64
 float_choice = torch.float64
 torch.set_default_dtype(float_choice)
 
-class CEM:
+class RENYI:
     def __init__(self, env_id, episode_nr, step_nr, heatmap_cmap, heatmap_labels, heatmap_interp,
                  parallel_envs=8, int_type=int_choice, float_type=float_choice, omega=3000,
-                 k=1, delta=1, max_off_iters=1, use_backtracking=True, backtrack_coeff=0, 
-                 max_backtrack_try=0, eps=1e-5, d=1, lambda_policy=1e-3, lambda_value=1e-3, 
-                 lambda_omega=1e-3, epoch_nr=500, is_renyi=False, seed=None, out_path=""):    
+                 k=1, delta=1, max_off_iters=1, use_backtracking=True, backtrack_coeff=0, max_backtrack_try=0, 
+                 eps=1e-5, d=1, eta=1e-4, epsilon=0.2, alpha=1, lambda_vae=1e-3, lambda_entropy_value=1e-3, 
+                 lambda_cost_value=1e-3, lambda_policy=1e-3, lambda_omega=1e-3, epoch_nr=500, 
+                 seed=None, out_path="", use_behavioral=False):    
         """
         T: Number of trajectories/episodes
         N: Number of time steps
         delta: Trust-region threshold (Maximum KL Divergence between two avg state density distributions)
         omega (see below): Safety weight/Lagrange multiplier (0 or larger)
         lambda: Learning rate
-        k: Number of neighbors
         d: Safety threshold
         gamma: Discount factor of cost over time
         """   
@@ -53,16 +54,21 @@ class CEM:
         self.max_backtrack_try = max_backtrack_try
         self.eps = eps
         self.d = d
+        self.lambda_vae = lambda_vae
+        self.lambda_entropy_value = lambda_entropy_value
+        self.lambda_cost_value = lambda_cost_value
         self.lambda_policy = lambda_policy
-        self.lambda_value = lambda_value
         self.lambda_omega = lambda_omega
         self.episode_nr = episode_nr
         self.step_nr = step_nr        
         self.epoch_nr = epoch_nr
         self.gamma = 0.99
-        self.is_renyi = is_renyi
         self.omega = omega
+        self.eta = eta
+        self.epsilon = epsilon
+        self.alpha = alpha
         self.patience = 50
+        self.use_behavioral = use_behavioral
 
         # == Environment State ==
         self.envs = None
@@ -71,15 +77,17 @@ class CEM:
         self.state_dim = 0
         self.action_dim = 0
         self.num_workers = 1
-        self.B = 0
-        self.G = 0
 
         # == Neural Networks ==
         self.behavioral_policy = None
         self.target_policy = None
-        self.value_nn = None
+        self.entropy_value_nn = None
+        self.cost_value_nn = None
+        self.vae = None
         self.policy_optimizer = None
-        self.value_optimizer = None
+        self.entropy_value_optimizer = None
+        self.cost_value_optimizer = None
+        self.vae_optimizer = None
 
         # == Heatmap Settings ==
         self.heatmap_cmap = heatmap_cmap
@@ -138,20 +146,6 @@ class CEM:
             # Final state
             states[loop_offset: loop_offset + self.parallel_envs, self.step_nr] = s
 
-        return states, actions, costs, next_states
-
-    def collect_particles_and_compute_knn(self):
-        # Run simulations
-        states, actions, costs, next_states = self.collect_particles()
-
-        print("\nCompute KNN starts")
-        # Fit kNN for state density estimation
-        reshaped_next_states = next_states.reshape(-1, self.state_dim)  # (num_samples, state_dim)
-        nbrs = NearestNeighbors(n_neighbors = self.k + 1, metric = 'euclidean', algorithm = 'auto', n_jobs = self.num_workers)
-        nbrs.fit(reshaped_next_states)
-        distances, indices = nbrs.kneighbors(reshaped_next_states)
-        print("\nCompute KNN finishes")
-
         # Convert to PyTorch tensors
         states = torch.tensor(states, dtype=self.float_type, device=self.device)
         if self.is_discrete:
@@ -160,10 +154,8 @@ class CEM:
             actions = torch.tensor(actions, dtype=self.float_type, device=self.device)
         costs = torch.tensor(costs, dtype=self.float_type, device=self.device)
         next_states = torch.tensor(next_states, dtype=self.float_type, device=self.device)
-        distances = torch.tensor(distances, dtype=self.float_type, device=self.device)
-        indices = torch.tensor(indices, dtype=self.int_type, device=self.device)
 
-        return states, actions, costs, next_states, distances, indices
+        return states, actions, costs, next_states
     
     def get_heatmap(self, title = None):
         """
@@ -241,57 +233,39 @@ class CEM:
     
 
     # Optimization and Evaluation
+    def train_vae(self, states, actions, train=True):
+        # Stack state and action
+        sa_pairs = torch.cat([states[:, :-1, :], actions], dim=-1)  # shape (episodes, steps, state_dim+action_dim)
+        sa_pairs = sa_pairs.reshape(-1, self.state_dim + self.action_dim)
+
+        # VAE training
+        batch_size = 256
+        dataset = torch.utils.data.TensorDataset(sa_pairs)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        print("\nTraining VAE...")
+        vae_loss = 0
+        for batch in dataloader:
+            x_batch = batch[0]
+            loss = self.vae(x_batch)
+
+            if train:
+                self.vae_optimizer.zero_grad()
+                loss.backward()
+                self.vae_optimizer.step()
+
+            vae_loss += loss.item()
+
+        return vae_loss
+        
     def compute_importance_weights(self, behavioral_policy, target_policy, states, actions):
-        # Initialize to None for the first concat
-        importance_weights = None
+        # Log probabilities under both policies
+        logp = target_policy.get_log_p(states[:, : -1], actions)
+        old_logp = behavioral_policy.get_log_p(states[:, : -1], actions)
 
-        # Compute the importance weights
-        # build iw vector incrementally from trajectory particles
-        print("\nCompute importance weights")
-        for episode in tqdm(range(self.episode_nr)):
-            # Last state (terminal) is discarded to match the action length
-            traj_states = states[episode, : -1]
-            traj_actions = actions[episode]
-
-            traj_target_log_p = target_policy.get_log_p(traj_states, traj_actions)
-            traj_behavior_log_p = behavioral_policy.get_log_p(traj_states, traj_actions)
-
-            traj_particle_iw = torch.exp(torch.cumsum(traj_target_log_p - traj_behavior_log_p, dim = 0))
-
-            if importance_weights is None:
-                importance_weights = traj_particle_iw
-            else:
-                importance_weights = torch.cat([importance_weights, traj_particle_iw], dim=0)
-
-        # Normalize the weights
-        importance_weights /= torch.sum(importance_weights)
+        # Compute importance ratio
+        importance_weights = torch.exp(logp - old_logp)
         return importance_weights
-
-    def compute_entropy(self, behavioral_policy, target_policy, states, actions,
-                        distances, indices):
-        importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
-        weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim = 1)
-        volumes = (torch.pow(distances[:, self.k], self.state_dim) *
-                torch.pow(torch.tensor(np.pi), self.state_dim / 2)) / self.G
-
-        if self.is_renyi:
-            renyi_order = 2.0
-            density_estimate = weights_sum / (volumes + self.eps)
-            renyi_entropy = 1.0 / (1.0 - renyi_order) * torch.log(torch.sum(torch.pow(density_estimate, renyi_order)) + self.eps)
-            entropy_per_episode = renyi_entropy.view(1)
-        else:
-            entropy_terms = -(weights_sum / self.k) * torch.log((weights_sum / (volumes + self.eps)) + self.eps)
-            entropy_terms_per_episode = entropy_terms.view(self.episode_nr, self.step_nr)
-            entropy_per_episode = torch.sum(entropy_terms_per_episode, dim = 1) + self.B
-
-        mean_entropy = torch.mean(entropy_per_episode)
-        std_entropy = torch.std(entropy_per_episode, unbiased=False)
-
-        if self.is_discrete:
-            entropy_bonus_weight = 0.01
-            mean_entropy += entropy_bonus_weight * mean_entropy
-
-        return mean_entropy, std_entropy
 
     def compute_discounted_cost(self, costs):
         """
@@ -308,9 +282,42 @@ class CEM:
         std_cost = discounted_costs.std().cpu()
 
         return mean_cost, std_cost
-    
-    def compute_advantage(self, behavioral_policy, target_policy, states, actions, costs, update = False):
-        V = self.value_nn(states)
+
+    def compute_entropy_reward(self, states, actions):
+        print("\nCompute entropy using VAE")
+        
+        # Use only up to timestep T (ignore final s_T+1)
+        sa = torch.cat([states[:, : -1], actions], dim=-1)  # shape: (episodes, steps, state_dim + action_dim)
+        sa_flat = sa.reshape(-1, self.state_dim + self.action_dim)  # flatten to shape (B*T, D)
+
+        # Compute log-likelihood under VAE decoder
+        with torch.inference_mode():
+            z = self.vae.encoder.sample(sa_flat)
+            log_probs = self.vae.decoder.log_prob(x=sa_flat, z=z)  # shape: (B*T,)
+
+            # Behavioral Entropy
+            if self.use_behavioral:
+                # Behavioral entropy reward using distances between latent codes
+                dists = torch.cdist(z, z, p=2)  # pairwise distances (B*T, B*T)
+                sorted_dists, _ = torch.sort(dists, dim=1)
+                Rk = sorted_dists[:, self.k]  # distance to k-th nearest neighbor
+                beta = np.exp((1 - self.alpha) * np.log(np.log(z.shape[1])))
+                log_term = torch.log(Rk + self.eps)
+                entropy_reward = Rk * torch.exp(-beta * (log_term ** self.alpha)) * (log_term ** self.alpha)
+                entropy_reward = entropy_reward.view(self.episode_nr, self.step_nr, 1)
+            else:
+                # Convert to negative log-prob (entropy reward)
+                if self.alpha == 1:
+                    entropy_reward = -log_probs
+                else:
+                    # Convert to estimated density: p(x) ≈ exp(log p(x | z))
+                    entropy_reward = torch.pow(torch.exp(log_probs) + self.eps, self.alpha - 1)
+            entropy_reward = entropy_reward.view(self.episode_nr, self.step_nr, 1)
+        
+        return entropy_reward
+
+    def compute_cost_advantage(self, states, costs, update = False):
+        V = self.cost_value_nn(states)
 
         old_V = V[:, : -1, :]
         new_V = V[:, 1:, :]
@@ -324,51 +331,50 @@ class CEM:
 
         # Compute advantage loss (A part of policy network loss)
         # A(s_t, a_t) = c_t + γ * V(s_{t+1}) - V(s_t)
+        # TD(0) is used here
         advantage = costs + self.gamma * new_V - old_V
+        return advantage
 
-        # E(A(s, a) * pi(theta)(a|s) / pi(theta')(a|s))
-        importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
-        advantage_loss = torch.mean(advantage.view(-1) * importance_weights)
+    def compute_entropy_advantage(self, states, rewards, update = False):
+        # TD(lambda) is used here
+        lam = 0.95
+        V = self.entropy_value_nn(states)  # shape: (batch_size, T+1, 1)
 
-        # Manually increase the magnitude because it is too small
-        return advantage_loss
+        old_V = V[:, : -1, :]
+        new_V = V[:, 1:, :]
 
-    def compute_kl(self, behavioral_policy, target_policy, states, actions, indices):
-        importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
+        # TD residuals (deltas)
+        deltas = rewards + self.gamma * new_V - old_V  # shape: (batch_size, T)
+        deltas = deltas.squeeze(-1)
 
-        weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim = 1)
+        # GAE advantage computation via backward recursion
+        advantage = torch.zeros_like(deltas)
+        gae = torch.zeros(deltas.shape[0], device=self.device)
 
-        # Compute KL divergence between behavioral and target policy
-        kl = (1 / self.episode_nr / self.step_nr) * torch.sum(torch.log(self.k / (self.episode_nr * self.step_nr * weights_sum) + self.eps))
+        for t in reversed(range(deltas.shape[1])):
+            gae = deltas[:, t] + self.gamma * lam * gae
+            advantage[:, t] = gae
 
-        numeric_error = torch.isinf(kl) or torch.isnan(kl)
+        if update:
+            # Create value targets: A_t + V(s_t)
+            target = advantage.unsqueeze(-1).detach() + old_V  # stop gradient through advantage
+            value_loss = nn.functional.mse_loss(old_V, target)
+            return value_loss
 
-        # Minimum KL is zero
-        # NOTE: do not remove epsilon factor
-        kl = torch.max(torch.tensor(0.0), kl)
+        # Otherwise, return advantage for policy update
+        # Flatten for expected shape: (batch_size * T,)
+        return advantage.view(-1)
 
-        return kl, numeric_error
-
-    def policy_update(self, optimizer, behavioral_policy, target_policy, 
-                      states, actions, advantage_loss, distances, indices):
-        optimizer.zero_grad()
-
-        # Maximize entropy
-        mean_entropy, std_entropy = self.compute_entropy(behavioral_policy, target_policy, states, actions, distances, indices)
-        loss = -mean_entropy + self.omega * advantage_loss
-
-        numeric_error = torch.isinf(loss) or torch.isnan(loss)
-
-        loss.backward()
-        optimizer.step()
-
-        return loss, numeric_error, mean_entropy, std_entropy
-
+    def compute_policy_entropy(self, policy):
+        # Compute Shannon entropy over actions
+        entropy = 0.5 * self.action_dim * (1.0 + np.log(2 * np.pi)) + torch.sum(policy.log_std)
+        return entropy
+    
 
     # Logging
-    def log_epoch_statistics(self, log_file, csv_file_1, csv_file_2, epoch,
-                            value_loss, policy_loss, safety_weight, value_lr, 
-                            advantage, mean_entropy, std_entropy, mean_cost, std_cost, num_off_iters, execution_time,
+    def log_epoch_statistics(self, log_file, csv_file_1, csv_file_2, epoch, vae_loss, entropy_value_loss, 
+                             cost_value_loss, policy_loss, safety_weight, value_lr, entropy_advantage,
+                             cost_advantage, policy_entropy, mean_cost, std_cost, num_off_iters, execution_time,
                             heatmap_image, heatmap_entropy, backtrack_iters, backtrack_lr):
         # Prepare tabulate table
         table = []
@@ -376,10 +382,13 @@ class CEM:
         table.extend([
             ["Epoch", epoch],
             ["Execution time (s)", fancy_float(execution_time)],
-            ["Value loss", fancy_float(value_loss)],
+            ["VAE loss", fancy_float(vae_loss)],
+            ["Entropy Value loss", fancy_float(entropy_value_loss)],
+            ["Cost Value loss", fancy_float(cost_value_loss)],
             ["Policy loss", fancy_float(policy_loss)],
-            ["Advantage", fancy_float(advantage)],
-            ["Entropy", fancy_float(mean_entropy)],
+            ["Entropy Advantage", fancy_float(entropy_advantage)],
+            ["Cost Advantage", fancy_float(cost_advantage)],
+            ["Policy Entropy", fancy_float(policy_entropy)],
             ["Cost", fancy_float(mean_cost)],
             ["Off-policy iters", num_off_iters]
         ])
@@ -397,7 +406,7 @@ class CEM:
         fancy_grid = tabulate(table, headers="firstrow", tablefmt="fancy_grid", numalign='right')
 
         # Log to csv file 1
-        csv_file_1.write(f"{epoch},{value_loss},{policy_loss},{safety_weight},{value_lr},{advantage},{mean_entropy},{std_entropy},{mean_cost},{std_cost},{num_off_iters},{execution_time}\n")
+        csv_file_1.write(f"{epoch},{vae_loss},{entropy_value_loss},{cost_value_loss},{policy_loss},{safety_weight},{value_lr},{entropy_advantage},{cost_advantage},{policy_entropy},{mean_cost},{std_cost},{num_off_iters},{execution_time}\n")
         csv_file_1.flush()
 
         # Log to csv file 2
@@ -410,12 +419,6 @@ class CEM:
         log_file.write("\n\n")
         log_file.flush()
         print(fancy_grid)
-
-    def log_off_iter_statistics(self, csv_file_3, epoch, num_off_iter, global_off_iter,
-                                loss, advantage, mean_entropy, std_entropy, kl, mean_cost, std_cost, lr):
-        # Log to csv file 3
-        csv_file_3.write(f"{epoch},{num_off_iter},{global_off_iter},{loss},{advantage},{mean_entropy},{std_entropy},{kl},{mean_cost},{std_cost},{lr}\n")
-        csv_file_3.flush()
     
 
     # Main Training
@@ -444,36 +447,62 @@ class CEM:
             self.action_dim = 1
         else:
             self.action_dim = self.envs.single_action_space.shape[0]        
-        
-        # Fix constants
-        self.B = np.log(self.k) - scipy.special.digamma(self.k)
-        self.G = scipy.special.gamma(self.state_dim / 2 + 1)  
 
     def _initialize_networks(self):
         # Initialize policy neural network
-        # Create a behavioral, a target policy and a tmp policy used to save valid target policies
+        # Create a behavioral policy and a target policy
         # (those with kl <= kl_threshold) during off policy opt
         self.behavioral_policy = self.create_policy(is_behavioral=True)
         self.target_policy = self.create_policy()
-        last_valid_target_policy = self.create_policy()
         self.target_policy.load_state_dict(self.behavioral_policy.state_dict())
-        last_valid_target_policy.load_state_dict(self.behavioral_policy.state_dict())
+
+        # Initialize entropy value neural network
+        self.entropy_value_nn = ValueNetwork(self.state_dim, self.device).to(self.device)
+        self.entropy_value_optimizer = torch.optim.Adam(self.entropy_value_nn.parameters(), 
+                                                        lr = self.lambda_entropy_value) 
+
+        # Initialize cost value neural network
+        self.cost_value_nn = ValueNetwork(self.state_dim, self.device).to(self.device)
+        self.cost_value_optimizer = torch.optim.Adam(self.cost_value_nn.parameters(), lr = self.lambda_cost_value)       
 
         # Set optimizer for policy
         self.policy_optimizer = torch.optim.Adam(self.target_policy.parameters(), lr = self.lambda_policy)
 
-        # Initialize value neural network
-        self.value_nn = ValueNetwork(self.state_dim, self.device).to(self.device)
-        self.value_optimizer = torch.optim.Adam(self.value_nn.parameters(), lr = self.lambda_value)
-
-        return last_valid_target_policy       
+        # Initialize VAE neural network
+        D = self.state_dim + self.action_dim
+        L = 32  # latent dimension
+        M = 256  # hidden dimension size
+        num_components = 16  # for Mixture prior
+        encoder_net = nn.Sequential(
+            nn.Linear(D, M),
+            nn.ReLU(),
+            nn.Linear(M, M),
+            nn.ReLU(),
+            nn.Linear(M, 2 * L)
+        )
+        encoder = Encoder(encoder_net)
+        decoder_net = nn.Sequential(
+            nn.Linear(L, M),
+            nn.ReLU(),
+            nn.Linear(M, M),
+            nn.ReLU(),
+            nn.Linear(M, 2 * D)
+        )
+        decoder = Decoder(decoder_net)
+        prior = Prior(L=L, num_components=num_components)
+        self.vae = VAE(encoder, decoder, prior, L=L)
+        self.vae.encoder.to(self.device)
+        self.vae.decoder.to(self.device)
+        self.vae.prior.to(self.device)        
+        self.vae.to(self.device)
+        self.vae_optimizer = torch.optim.Adam(self.vae.parameters(), lr=self.lambda_vae)           
 
     def _initialize_logging(self):
         # Create log files
         log_file = open(os.path.join((self.out_path), 'log_file.txt'), 'a', encoding="utf-8")
 
         csv_file_1 = open(os.path.join(self.out_path, f"{self.env_id}.csv"), 'w')
-        csv_file_1.write(",".join(['epoch', 'value_loss', 'policy_loss', 'safety_weight', 'value_learning_rate', 'advantage', 'mean_entropy', 'std_entropy', 'mean_cost', 'std_cost', 'num_off_iters','execution_time']))
+        csv_file_1.write(",".join(['epoch', 'vae_loss', 'entropy_value_loss', 'cost_value_loss', 'policy_loss', 'safety_weight', 'value_learning_rate', 'entropy_advantage', 'cost_advantage', 'policy_entropy', 'mean_cost', 'std_cost', 'num_off_iters','execution_time']))
         csv_file_1.write("\n")
 
         if self.heatmap_discretizer is not None:
@@ -483,11 +512,7 @@ class CEM:
         else:
             csv_file_2 = None
 
-        csv_file_3 = open(os.path.join(self.out_path, f"{self.env_id}_off_policy_iter.csv"), "w")
-        csv_file_3.write(",".join(['epoch', 'off_policy_iter', 'global_off_policy_iter', 'loss', 'advantage', 'mean_entropy', 'std_entropy', 'kl', 'mean_cost', 'std_cost', 'policy_learning_rate']))
-        csv_file_3.write("\n")
-
-        return log_file, csv_file_1, csv_file_2, csv_file_3
+        return log_file, csv_file_1, csv_file_2
 
     def _plot_heatmap(self, best_epoch):
         # Heatmap
@@ -512,47 +537,68 @@ class CEM:
         t0 = time.time()
 
         # Entropy
-        states, actions, costs, next_states, distances, indices = \
-            self.collect_particles_and_compute_knn()
+        states, actions, costs, next_states = self.collect_particles()
 
         with torch.inference_mode():
-            mean_entropy, std_entropy = self.compute_entropy(self.behavioral_policy, self.behavioral_policy, states, 
-                                           actions, distances, indices)   
-            value_loss = self.compute_advantage(self.behavioral_policy, self.target_policy, states, actions, costs, True)
-            advantage_loss = self.compute_advantage(self.behavioral_policy, self.target_policy, states, actions, costs)
-            policy_loss = -mean_entropy + self.omega * advantage_loss                 
+            vae_loss = self.train_vae(states, actions, False)
+            entropy_reward = self.compute_entropy_reward(states, actions)  
+            entropy_value_loss = self.compute_entropy_advantage(states, entropy_reward, True)
+            cost_value_loss = self.compute_cost_advantage(states, costs, True)
+            
+            importance_weights = self.compute_importance_weights(self.behavioral_policy, self.behavioral_policy, states, actions)
+            entropy_advantage = self.compute_entropy_advantage(states, entropy_reward)
+            # Clip the advantage as per PPO
+            clipped_adv = torch.where(
+                entropy_advantage >= 0,
+                (1 + self.epsilon) * entropy_advantage,
+                (1 - self.epsilon) * entropy_advantage
+            )
+            # PPO loss: negative of min (r * A, clipped A)
+            entropy_advantage_loss = torch.mean(torch.min(importance_weights * entropy_advantage, clipped_adv))
+
+            cost_advantage = self.compute_cost_advantage(states, costs)
+            cost_advantage_loss = torch.mean(cost_advantage.view(-1) * importance_weights)
+
+            policy_entropy = self.compute_policy_entropy(self.behavioral_policy)
+
+            policy_loss = -entropy_advantage_loss + self.omega * cost_advantage_loss - self.eta * policy_entropy
 
         print("\nEntropy computed")
 
         execution_time = time.time() - t0
-        mean_entropy = mean_entropy.cpu().numpy()
-        std_entropy = std_entropy.cpu().numpy()
+        policy_entropy = policy_entropy.detach().cpu().numpy()
+        entropy_value_loss = entropy_value_loss.cpu().numpy()
+        entropy_advantage_loss = entropy_advantage_loss.cpu().numpy()
         mean_cost, std_cost = self.compute_discounted_cost(costs)
-        value_loss = value_loss.cpu().numpy()
-        advantage_loss = advantage_loss.cpu().numpy()
+        cost_value_loss = cost_value_loss.cpu().numpy()
+        cost_advantage_loss = cost_advantage_loss.cpu().numpy()
         policy_loss = policy_loss.cpu().numpy()
 
         # Heatmap
         heatmap_entropy, heatmap_image = self._plot_heatmap(0)
 
         # Save initial policy
+        torch.save(self.vae.state_dict(), os.path.join(self.out_path, "0-vae.pt"))
         torch.save(self.behavioral_policy.state_dict(), os.path.join(self.out_path, "0-policy.pt"))
-        torch.save(self.value_nn.state_dict(), os.path.join(self.out_path, "0-value.pt"))
+        torch.save(self.entropy_value_nn.state_dict(), os.path.join(self.out_path, "0-entropy-value.pt"))
+        torch.save(self.cost_value_nn.state_dict(), os.path.join(self.out_path, "0-cost-value.pt"))
 
         safety_weight = self.omega
-        value_lr = self.lambda_value
+        value_lr = self.lambda_cost_value
 
         # Log statistics for the initial policy
         self.log_epoch_statistics(
             log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
             epoch=0,
-            value_loss=value_loss,
+            vae_loss=vae_loss,
+            entropy_value_loss=entropy_value_loss,
+            cost_value_loss=cost_value_loss,
             policy_loss=policy_loss,
             safety_weight=safety_weight,
             value_lr=value_lr,
-            advantage=advantage_loss,
-            mean_entropy=mean_entropy,
-            std_entropy=std_entropy,
+            entropy_advantage=entropy_advantage_loss,
+            cost_advantage=cost_advantage_loss,
+            policy_entropy=policy_entropy,
             mean_cost=mean_cost,
             std_cost=std_cost,
             num_off_iters=0,
@@ -563,92 +609,28 @@ class CEM:
             backtrack_lr=None
         )
 
-        return value_loss, policy_loss, heatmap_entropy, heatmap_image
+        return vae_loss, entropy_value_loss, cost_value_loss, policy_loss, heatmap_entropy, heatmap_image
     
-    def _optimize_kl(self, states, actions, costs, distances, indices, original_lr, 
-                     last_valid_target_policy, backtrack_iter, csv_file_3, epoch, num_off_iters, 
-                     global_num_off_iters, mean_behavorial_costs, std_behavorial_costs):
-        
-        kl_threshold_reached = False
-
-        while not kl_threshold_reached:
-            print("\nOptimizing KL continues")
-            # Use the newly computed advantage loss
-            advantage_loss = self.compute_advantage(self.behavioral_policy, self.target_policy, states, actions, costs)                
-            # Update target policy network    
-            loss, numeric_error, mean_entropy, std_entropy = self.policy_update(self.policy_optimizer, self.behavioral_policy, 
-                                                                    self.target_policy, states, actions, 
-                                                                    advantage_loss, distances, indices)
-            mean_entropy = mean_entropy.detach().cpu().numpy()
-            std_entropy = std_entropy.detach().cpu().numpy()
-            loss = loss.detach().cpu().numpy()
-
-            with torch.inference_mode():
-                kl, kl_numeric_error = self.compute_kl(self.behavioral_policy, self.target_policy, states, actions, indices)
-
-            kl = kl.cpu().numpy()
-
-            if not numeric_error and not kl_numeric_error and kl <= self.delta:
-                # Valid update
-                last_valid_target_policy.load_state_dict(self.target_policy.state_dict())
-                num_off_iters += 1
-                global_num_off_iters += 1
-                lr = self.lambda_policy
-                # Log statistics for this off policy iteration
-                self.log_off_iter_statistics(csv_file_3, epoch, num_off_iters - 1, global_num_off_iters - 1,
-                                             loss, advantage_loss, mean_entropy, std_entropy, kl, 
-                                             mean_behavorial_costs, std_behavorial_costs, lr)                
-
-            else:
-                if self.use_backtracking:
-                    # We are here either because we could not perform any update for this epoch
-                    # or because we need to perform one last update
-                    if not backtrack_iter == self.max_backtrack_try:
-                        self.target_policy.load_state_dict(last_valid_target_policy.state_dict())
-
-                        self.lambda_policy = original_lr / (self.backtrack_coeff ** backtrack_iter)
-
-                        for param_group in self.policy_optimizer.param_groups:
-                            param_group['lr'] = self.lambda_policy
-
-                        backtrack_iter += 1
-                        continue
-
-                # Do not accept the update, set exit condition to end the epoch
-                kl_threshold_reached = True
-
-            if self.use_backtracking and backtrack_iter > 1:
-                # Just perform at most 1 step using backtracking
-                kl_threshold_reached = True
-
-            if num_off_iters == self.max_off_iters:
-                # Set exit condition also if the maximum number
-                # of off policy opt iterations has been reached
-                kl_threshold_reached = True 
-
-        return backtrack_iter, num_off_iters, global_num_off_iters
-    
-    def _epoch_train(self, value_loss, policy_loss, last_valid_target_policy, log_file, csv_file_1, csv_file_2, csv_file_3, heatmap_entropy, heatmap_image):
+    def _epoch_train(self, vae_loss, entropy_value_loss, cost_value_loss, policy_loss, log_file, csv_file_1, csv_file_2, heatmap_entropy, heatmap_image):
         if self.use_backtracking:
             original_lr = self.lambda_policy
 
-        best_value_loss = value_loss
+        best_vae_loss = vae_loss
+        best_cost_value_loss = cost_value_loss
+        best_entropy_value_loss = entropy_value_loss
         best_loss = policy_loss
         best_epoch = 0
         patience_counter = 0
-        global_num_off_iters = 0
 
         for epoch in range(1, self.epoch_nr + 1):
             print(f"Epoch {epoch} starts")
             t0 = time.time()
 
             # Off policy optimization
-            last_valid_target_policy.load_state_dict(self.behavioral_policy.state_dict())
             num_off_iters = 0
 
             # Collect particles to optimize off policy
-            states, actions, costs, next_states, distances, indices = \
-                self.collect_particles_and_compute_knn()
+            states, actions, costs, next_states = self.collect_particles()
 
             if self.use_backtracking:
                 self.lambda_policy = original_lr
@@ -660,88 +642,110 @@ class CEM:
             else:
                 backtrack_iter = None
 
+            # Update VAE
+            vae_loss = self.train_vae(states, actions)
+            if vae_loss < best_vae_loss:
+                torch.save(self.vae.state_dict(), os.path.join(self.out_path, f"{epoch}-vae.pt"))               
+
+            # Update entropy value network
+            self.entropy_value_optimizer.zero_grad()
+            entropy_reward = self.compute_entropy_reward(states, actions)  
+            entropy_value_loss = self.compute_entropy_advantage(states, entropy_reward, True)
+            entropy_value_loss.backward()
+            self.entropy_value_optimizer.step()
+            entropy_value_loss = entropy_value_loss.detach().cpu().numpy()
+            if entropy_value_loss < best_entropy_value_loss:
+                torch.save(self.entropy_value_nn.state_dict(), os.path.join(self.out_path, f"{epoch}-entropy-value.pt"))            
+
             # Update safety weight (omega)
             self.omega = max(0, self.omega + self.lambda_omega * (torch.sum(costs) / self.episode_nr - self.d))
-            mean_behavorial_costs, std_behavorial_costs = self.compute_discounted_cost(costs)
+            # mean_behavorial_costs, std_behavorial_costs = self.compute_discounted_cost(costs)
 
-            # Update value network
-            self.value_optimizer.zero_grad()
-            value_loss = self.compute_advantage(self.behavioral_policy, self.target_policy, states, actions, costs, True)            
-            value_loss.backward()
-            self.value_optimizer.step()
-            value_loss = value_loss.detach().cpu().numpy()
-            if value_loss < best_value_loss:
-                torch.save(self.value_nn.state_dict(), os.path.join(self.out_path, f"{epoch}-value.pt"))
+            # Update cost value network
+            self.cost_value_optimizer.zero_grad()
+            cost_value_loss = self.compute_cost_advantage(states, costs, True)            
+            cost_value_loss.backward()
+            self.cost_value_optimizer.step()
+            cost_value_loss = cost_value_loss.detach().cpu().numpy()
+            if cost_value_loss < best_cost_value_loss:
+                torch.save(self.cost_value_nn.state_dict(), os.path.join(self.out_path, f"{epoch}-cost-value.pt"))
 
-            backtrack_iter, num_off_iters, global_num_off_iters = self._optimize_kl(states, actions, costs, distances, indices, original_lr, last_valid_target_policy, backtrack_iter, csv_file_3, epoch, num_off_iters, global_num_off_iters, mean_behavorial_costs, std_behavorial_costs)
+            importance_weights = self.compute_importance_weights(self.behavioral_policy, self.target_policy, states, actions)
+            entropy_advantage = self.compute_entropy_advantage(states, entropy_reward)
+            # Clip the advantage as per PPO
+            clipped_adv = torch.where(
+                entropy_advantage >= 0,
+                (1 + self.epsilon) * entropy_advantage,
+                (1 - self.epsilon) * entropy_advantage
+            )
+            # PPO loss: negative of min (r * A, clipped A)
+            entropy_advantage_loss = torch.mean(torch.min(importance_weights * entropy_advantage, clipped_adv))
 
-            # Compute entropy of new policy
-            with torch.inference_mode():
-                advantage_loss = self.compute_advantage(self.behavioral_policy, self.behavioral_policy, states, actions, costs)                        
-                mean_entropy, std_entropy = self.compute_entropy(self.behavioral_policy, self.behavioral_policy, states, 
-                                                actions, distances, indices)
+            cost_advantage = self.compute_cost_advantage(states, costs)
+            cost_advantage_loss = torch.mean(cost_advantage.view(-1) * importance_weights)
 
-            if torch.isnan(mean_entropy) or torch.isinf(mean_entropy):
-                print("Aborting because final entropy is nan or inf...")
-                print("There is most likely a problem in knn aliasing. Use a higher k.")
-                exit()
+            policy_entropy = self.compute_policy_entropy(self.behavioral_policy)
+
+            # Update policy network
+            self.policy_optimizer.zero_grad()
+            loss = -entropy_advantage_loss + self.omega * cost_advantage_loss - self.eta * policy_entropy
+            loss.backward()
+            self.policy_optimizer.step()
+            loss = loss.detach().cpu().numpy()
+            policy_entropy = policy_entropy.detach().cpu().numpy()
+            mean_cost, std_cost = self.compute_discounted_cost(costs)
+            execution_time = time.time() - t0
+
+            backtrack_lr = self.lambda_policy
+            safety_weight = self.omega
+            value_lr = self.lambda_cost_value
+            # Log statistics for the initial policy
+            self.log_epoch_statistics(
+                log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
+                epoch=epoch,
+                vae_loss=vae_loss,
+                entropy_value_loss=entropy_value_loss,
+                cost_value_loss=cost_value_loss,
+                policy_loss=policy_loss,
+                safety_weight=safety_weight,
+                value_lr=value_lr,
+                entropy_advantage=entropy_advantage_loss,
+                cost_advantage=cost_advantage_loss,
+                policy_entropy=policy_entropy,
+                mean_cost=mean_cost,
+                std_cost=std_cost,
+                num_off_iters=num_off_iters,
+                execution_time=execution_time,
+                heatmap_image=heatmap_image,
+                heatmap_entropy=heatmap_entropy,
+                backtrack_iters=None,
+                backtrack_lr=None
+            )    
+
+            if loss < best_loss:
+                # Save policy
+                torch.save(self.behavioral_policy.state_dict(), os.path.join(self.out_path, f"{epoch}-policy.pt"))
+                patience_counter = 0
+                best_epoch = epoch
             else:
-                # End of epoch, prepare statistics to log
-                # Update behavioral policy
-                self.behavioral_policy.load_state_dict(last_valid_target_policy.state_dict())
-                self.target_policy.load_state_dict(last_valid_target_policy.state_dict())
+                patience_counter += 1
+                if patience_counter == self.patience:
+                    break  
 
-                loss = (-mean_entropy + self.omega * advantage_loss).cpu().numpy()
-                mean_entropy = mean_entropy.cpu().numpy()
-                std_entropy = std_entropy.cpu().numpy()
-                mean_cost, std_cost = self.compute_discounted_cost(costs)
-                execution_time = time.time() - t0
-
-                backtrack_lr = self.lambda_policy
-                safety_weight = self.omega
-                value_lr = self.lambda_value
-                # Log statistics for the initial policy
-                self.log_epoch_statistics(
-                    log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
-                    epoch=epoch,
-                    value_loss=value_loss,
-                    policy_loss=loss,
-                    safety_weight=safety_weight,
-                    value_lr=value_lr,
-                    advantage=advantage_loss,
-                    mean_entropy=mean_entropy,
-                    std_entropy=std_entropy,
-                    mean_cost=mean_cost,
-                    std_cost=std_cost,
-                    num_off_iters=num_off_iters,
-                    execution_time=execution_time,
-                    heatmap_image=heatmap_image,
-                    heatmap_entropy=heatmap_entropy,
-                    backtrack_iters=None,
-                    backtrack_lr=None
-                )    
-
-                if loss < best_loss:
-                    # Save policy
-                    torch.save(self.behavioral_policy.state_dict(), os.path.join(self.out_path, f"{epoch}-policy.pt"))
-                    patience_counter = 0
-                    best_epoch = epoch
-                else:
-                    patience_counter += 1
-                    if patience_counter == self.patience:
-                        break  
+            if epoch // 5 == 0:
+                self.behavioral_policy.load_state_dict(self.target_policy.state_dict())
 
         return best_epoch        
 
     def train(self):
         self._initialize_device()
         self._initialize_envs()
-        last_valid_target_policy = self._initialize_networks()
-        log_file, csv_file_1, csv_file_2, csv_file_3 = self._initialize_logging()
+        self._initialize_networks()
+        log_file, csv_file_1, csv_file_2 = self._initialize_logging()
 
-        value_loss, policy_loss, heatmap_entropy, heatmap_image = self._run_initial_evaluation(log_file, csv_file_1, csv_file_2)
+        vae_loss, entropy_value_loss, cost_value_loss, policy_loss, heatmap_entropy, heatmap_image = self._run_initial_evaluation(log_file, csv_file_1, csv_file_2)
 
-        best_epoch = self._epoch_train(value_loss, policy_loss, last_valid_target_policy, log_file, csv_file_1, csv_file_2, csv_file_3, heatmap_entropy, heatmap_image)                                                                
+        best_epoch = self._epoch_train(vae_loss, entropy_value_loss, cost_value_loss, policy_loss, log_file, csv_file_1, csv_file_2, heatmap_entropy, heatmap_image)                                                                
         heatmap_entropy, heatmap_image = self._plot_heatmap(best_epoch)
 
         if isinstance(self.envs, gymnasium.vector.VectorEnv):
