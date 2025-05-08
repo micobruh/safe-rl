@@ -4,7 +4,7 @@ import numpy as np
 from gymnasium.vector import VectorEnvWrapper
 
 class SafeMountainCarWrapper(VectorEnvWrapper):
-    def __init__(self, env, safety_threshold=-0.6):
+    def __init__(self, env, safety_threshold=-1):
         super().__init__(env)
         self.safety_threshold = safety_threshold
 
@@ -31,7 +31,7 @@ class SafePendulumWrapper(VectorEnvWrapper):
         state, reward, terminated, truncated, info = self.env.step(action)
         
         # Add a safety cost when the angle is below horizontal
-        cost = np.where(abs(state[:, 0]) < 0, 1, 0)
+        cost = np.where(state[:, 0] < -0.5, 1, 0)
         
         return state, reward, cost, terminated, truncated, info
     

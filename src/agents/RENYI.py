@@ -25,7 +25,7 @@ class RENYI:
     def __init__(self, env_id, episode_nr, step_nr, heatmap_cmap, heatmap_labels, heatmap_interp,
                  parallel_envs=8, int_type=int_choice, float_type=float_choice, omega=3000,
                  k=1, delta=1, max_off_iters=1, use_backtracking=True, backtrack_coeff=0, max_backtrack_try=0, 
-                 eps=1e-5, d=1, eta=1e-4, epsilon=0.2, alpha=1, lambda_vae=1e-3, lambda_entropy_value=1e-3, 
+                 eps=1e-5, d=1, eta=1e-4, epsilon=0.2, alpha=1, beta=0, lambda_vae=1e-3, lambda_entropy_value=1e-3, 
                  lambda_cost_value=1e-3, lambda_policy=1e-3, lambda_omega=1e-3, epoch_nr=500, 
                  seed=None, out_path="", use_behavioral=False):    
         """
@@ -67,6 +67,7 @@ class RENYI:
         self.eta = eta
         self.epsilon = epsilon
         self.alpha = alpha
+        self.beta = 0
         self.patience = 50
         self.use_behavioral = use_behavioral
 
@@ -213,7 +214,7 @@ class RENYI:
             plt.bar([i for i in range(self.heatmap_discretizer.bins_sizes[0])], average_state_dist)
         
         # Safety constraint position in real world coordinates
-        safety_x_position = -0.6  # The x-value where the vertical line should be
+        safety_x_position = -1  # The x-value where the vertical line should be
 
         # Get x-axis bin edges from the discretizer
         x_bin_edges = self.heatmap_discretizer.bins[0]  # Assuming first dimension corresponds to x
@@ -297,14 +298,15 @@ class RENYI:
 
             # Behavioral Entropy
             if self.use_behavioral:
-                # Behavioral entropy reward using distances between latent codes
-                dists = torch.cdist(z, z, p=2)  # pairwise distances (B*T, B*T)
-                sorted_dists, _ = torch.sort(dists, dim=1)
-                Rk = sorted_dists[:, self.k]  # distance to k-th nearest neighbor
-                beta = np.exp((1 - self.alpha) * np.log(np.log(z.shape[1])))
-                log_term = torch.log(Rk + self.eps)
-                entropy_reward = Rk * torch.exp(-beta * (log_term ** self.alpha)) * (log_term ** self.alpha)
-                entropy_reward = entropy_reward.view(self.episode_nr, self.step_nr, 1)
+                entropy_reward = self.beta * torch.exp(-self.beta * ((-log_probs) ** self.alpha)) * ((-log_probs) ** self.alpha)
+                # # Behavioral entropy reward using distances between latent codes
+                # dists = torch.cdist(z, z, p=2)  # pairwise distances (B*T, B*T)
+                # sorted_dists, _ = torch.sort(dists, dim=1)
+                # Rk = sorted_dists[:, self.k]  # distance to k-th nearest neighbor
+                # beta = np.exp((1 - self.alpha) * np.log(np.log(z.shape[1])))
+                # log_term = torch.log(Rk + self.eps)
+                # entropy_reward = Rk * torch.exp(-beta * (log_term ** self.alpha)) * (log_term ** self.alpha)
+                # entropy_reward = entropy_reward.view(self.episode_nr, self.step_nr, 1)
             else:
                 # Convert to negative log-prob (entropy reward)
                 if self.alpha == 1:

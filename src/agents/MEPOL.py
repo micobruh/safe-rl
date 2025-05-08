@@ -213,7 +213,7 @@ class MEPOL:
             plt.bar([i for i in range(self.heatmap_discretizer.bins_sizes[0])], average_state_dist)
         
         # Safety constraint position in real world coordinates
-        safety_x_position = -0.6  # The x-value where the vertical line should be
+        safety_x_position = -1  # The x-value where the vertical line should be
 
         # Get x-axis bin edges from the discretizer
         x_bin_edges = self.heatmap_discretizer.bins[0]  # Assuming first dimension corresponds to x
