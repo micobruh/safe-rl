@@ -277,7 +277,7 @@ class CEM:
             reward = reward.view(self.episode_nr, self.step_nr)            
         else:
             importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
-            weights_sum = torch.sum(importance_weights[indices[:, :-1]], dim=1)
+            weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim=1)
             volumes = (torch.pow(distances[:, self.k], self.state_dim) *
                     torch.pow(torch.tensor(np.pi), self.state_dim / 2)) / self.G
 
