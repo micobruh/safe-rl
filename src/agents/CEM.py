@@ -225,17 +225,29 @@ class CEM:
             plt.bar([i for i in range(self.heatmap_discretizer.bins_sizes[0])], average_state_dist)
         
         # Safety constraint position in real world coordinates
-        safety_x_position = self.envs.get_safety_threshold()  # The x-value where the vertical line should be
+        safety_position = self.envs.get_safety_threshold()
 
-        # Get x-axis bin edges from the discretizer
-        x_bin_edges = self.heatmap_discretizer.bins[0]  # Assuming first dimension corresponds to x
+        if self.env_id == 'CartPole-v1':
+            # Get y-axis bin edges
+            y_bin_edges = self.heatmap_discretizer.bins[1] # Assuming second dimension corresponds to y
 
-        # Convert `safety_x_position` into **correct pixel index** in the heatmap
-        safety_x_index = np.searchsorted(x_bin_edges, safety_x_position)
+            # Convert to pixel bin indices
+            unsafe_y_min_index = np.searchsorted(y_bin_edges, -safety_position)
+            unsafe_y_max_index = np.searchsorted(y_bin_edges, safety_position)
 
-        # Plot vertical safety constraint **at correct bin index**
-        # plt.axvline(x=safety_x_index, color='r', label='Unsafe Region Boundary', linewidth=3)
-        plt.axvspan(plt.xlim()[0], safety_x_index, color='red', alpha=0.3, label="Unsafe Region")
+            # Shade above and below the safe region
+            plt.axhspan(plt.ylim()[0], unsafe_y_min_index, color='red', alpha=0.3, label="Unsafe Region")
+            plt.axhspan(unsafe_y_max_index, plt.ylim()[1], color='red', alpha=0.3)
+        else:    
+            # Get x-axis bin edges
+            x_bin_edges = self.heatmap_discretizer.bins[0]  # Assuming first dimension corresponds to x
+
+            # Convert to pixel bin indices
+            unsafe_x_index = np.searchsorted(x_bin_edges, safety_position)
+
+            # Shade vertical safety constraint
+            plt.axvspan(plt.xlim()[0], unsafe_x_index, color='red', alpha=0.3, label="Unsafe Region")
+        
         plt.legend()
 
         if title is not None:
