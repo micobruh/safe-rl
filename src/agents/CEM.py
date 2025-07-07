@@ -20,8 +20,7 @@ float_choice = torch.float64
 torch.set_default_dtype(float_choice)
 
 class CEM:
-    def __init__(self, env_id, episode_nr, step_nr, heatmap_cmap, heatmap_interp,
-                 parallel_envs=8, int_type=int_choice, float_type=float_choice, omega=100,
+    def __init__(self, env_id, episode_nr, step_nr, parallel_envs=8, int_type=int_choice, float_type=float_choice, omega=100,
                  k=1, alpha=0, zeta=1, delta=1, max_off_iters=1, use_backtracking=True, backtrack_coeff=0, 
                  max_backtrack_try=0, eps=1e-5, d=1, lambda_policy=1e-3, lambda_value=1e-3, 
                  lambda_omega=1e-3, epoch_nr=500, out_path="", use_behavioral=False, state_dependent_std=False):    
@@ -83,8 +82,8 @@ class CEM:
         self.value_optimizer = None
 
         # == Heatmap Settings ==
-        self.heatmap_cmap = heatmap_cmap
-        self.heatmap_interp = heatmap_interp
+        self.heatmap_cmap = 'Blues'
+        self.heatmap_interp = 'spline16'
         self.heatmap_discretizer = None
         if self.env_id == "MountainCarContinuous-v0" or self.env_id == "MountainCar-v0":
             self.heatmap_labels = ('Position', 'Velocity')
