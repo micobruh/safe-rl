@@ -91,7 +91,9 @@ class BaseAgent:
 
     # Environment and Setup
     def create_policy(self, is_behavioral=False):
-        policy = PolicyNetwork(self.state_dim, self.action_dim, self.state_dependent_std, self.is_discrete, self.device).to(self.device)
+        first_layer_neuron = 400 if self.env_id == "SafetyPointGoal1-v0" else 300
+        second_layer_neuron = 300
+        policy = PolicyNetwork(self.state_dim, self.action_dim, first_layer_neuron, second_layer_neuron, self.state_dependent_std, self.is_discrete, self.device).to(self.device)
 
         # if is_behavioral and not self.is_discrete:
         #     policy = train_supervised(self.envs, policy, self.lambda_policy, self.device, train_steps=100)
@@ -413,7 +415,9 @@ class BaseAgent:
         for model_link, title_txt in zip(model_lst, title_lst):
             # Create a behavioral, a target policy and a tmp policy used to save valid target policies
             # (those with kl <= kl_threshold) during off policy opt
-            self.behavioral_policy = PolicyNetwork(self.state_dim, self.action_dim, self.state_dependent_std, self.is_discrete, self.device)  # Recreate the model architecture
+            first_layer_neuron = 400 if self.env_id == "SafetyPointGoal1-v0" else 300
+            second_layer_neuron = 300            
+            self.behavioral_policy = PolicyNetwork(self.state_dim, self.action_dim, first_layer_neuron, second_layer_neuron, self.state_dependent_std, self.is_discrete, self.device)  # Recreate the model architecture
             self.behavioral_policy.load_state_dict(torch.load(model_link))
             self.behavioral_policy.to(self.device)  # Move model to the correct device (CPU/GPU)
             self.behavioral_policy.eval()  # Set to evaluation mode (disables dropout, batch norm, etc.)

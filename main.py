@@ -32,23 +32,23 @@ from src.agents.RENYI import RENYI
 # obj.train()
 
 obj = CEM(env_id="CartPole-v1", k=4, delta=0.5, max_off_iters=30,
-          use_backtracking=1, backtrack_coeff=2, max_backtrack_try=10, eps=1e-5, d=10,
+          use_backtracking=1, backtrack_coeff=2, max_backtrack_try=10, eps=1e-5, d=5,
           lambda_policy=1e-4, lambda_cost_value=1e-4, lambda_omega=1e-2, episode_nr=24, 
           step_nr=400, epoch_nr=3, out_path="results/CartPole/CEM")
 obj.train()
 
 # obj = CEM(env_id="MountainCarContinuous-v0", k=4, delta=0.5, max_off_iters=30,
-#           use_backtracking=1, backtrack_coeff=2, max_backtrack_try=10, eps=1e-5, d=10,
+#           use_backtracking=1, backtrack_coeff=2, max_backtrack_try=10, eps=1e-5, d=0.5,
 #           lambda_policy=1e-4, lambda_cost_value=1e-4, lambda_omega=1e-2, episode_nr=24, 
 #           step_nr=400, epoch_nr=3, out_path="results/MountainCarContinuous/CEM")
 # obj.train()
 
-# obj = RENYI(env_id="CartPole-v1", k=4, delta=0.5, epsilon=0.2, alpha=1, eps=1e-5, d=10,
+# obj = RENYI(env_id="CartPole-v1", k=4, delta=0.5, epsilon=0.2, alpha=1, eps=1e-5, d=5,
 #             lambda_vae=1e-3, lambda_cost_value=1e-4, lambda_entropy_value=1e-3, lambda_policy=1e-4, 
 #             lambda_omega=1e-2, episode_nr=24, step_nr=400, epoch_nr=3, out_path="results/CartPole/RENYI")
 # obj.train()
 
-# obj = RENYI(env_id="MountainCarContinuous-v0", k=4, delta=0.5, epsilon=0.2, alpha=1, eps=1e-5, d=10,
+# obj = RENYI(env_id="MountainCarContinuous-v0", k=4, delta=0.5, epsilon=0.2, alpha=1, eps=1e-5, d=0.5,
 #             lambda_vae=1e-3, lambda_cost_value=1e-4, lambda_entropy_value=1e-3, lambda_policy=1e-4, 
 #             lambda_omega=1e-2, episode_nr=24, step_nr=400, epoch_nr=3, out_path="results/MountainCarContinuous/RENYI")
 # obj.train()

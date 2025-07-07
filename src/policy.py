@@ -8,21 +8,21 @@ float_type = torch.float64
 torch.set_default_dtype(float_type)
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, state_dependent_std, is_discrete, device):
+    def __init__(self, state_dim, action_dim, first_layer_neuron, second_layer_neuron, state_dependent_std, is_discrete, device):
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(state_dim, 300), nn.ReLU(),
-            nn.Linear(300, 300), nn.ReLU(),
+            nn.Linear(state_dim, first_layer_neuron), nn.ReLU(),
+            nn.Linear(first_layer_neuron, second_layer_neuron), nn.ReLU(),
         )
 
         # Output of the network: Mean and log standard deviation
-        self.mean_head = nn.Linear(300, action_dim)
+        self.mean_head = nn.Linear(second_layer_neuron, action_dim)
         self.state_dependent_std = state_dependent_std
         
         if self.state_dependent_std:
             # std depends on state
-            self.log_std_head = nn.Linear(300, action_dim)
+            self.log_std_head = nn.Linear(second_layer_neuron, action_dim)
         else:
             # single learnable parameter
             self.log_std_param = nn.Parameter(

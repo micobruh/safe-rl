@@ -4,7 +4,7 @@ import numpy as np
 from gymnasium.vector import VectorEnvWrapper
 
 class SafeMountainCarWrapper(VectorEnvWrapper):
-    def __init__(self, env, safety_threshold=-0.6):
+    def __init__(self, env, safety_threshold=-0.8):
         super().__init__(env)
         self.safety_threshold = safety_threshold
 
