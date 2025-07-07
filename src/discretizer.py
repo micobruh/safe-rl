@@ -20,7 +20,6 @@ class Discretizer:
             features = self.lambda_transform(features)
             return tuple(np.digitize(x=features[i], bins=self.bins[i]) for i in range(len(features)))
 
-
     def get_empty_mat(self):
         return np.zeros(self.bins_sizes)
 
