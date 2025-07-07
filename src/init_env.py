@@ -4,7 +4,7 @@ import numpy as np
 from gymnasium.vector import VectorEnvWrapper
 
 class SafeMountainCarWrapper(VectorEnvWrapper):
-    def __init__(self, env, safety_threshold=-1):
+    def __init__(self, env, safety_threshold=-0.6):
         super().__init__(env)
         self.safety_threshold = safety_threshold
 
@@ -22,8 +22,11 @@ class SafeMountainCarWrapper(VectorEnvWrapper):
     def render(self):
         return self.env.render()
     
+    def get_safety_threshold(self):
+        return self.safety_threshold    
+    
 class SafePendulumWrapper(VectorEnvWrapper):
-    def __init__(self, env, safety_threshold=0):
+    def __init__(self, env, safety_threshold=-0.5):
         super().__init__(env)      
         self.safety_threshold = safety_threshold
 
@@ -31,7 +34,7 @@ class SafePendulumWrapper(VectorEnvWrapper):
         state, reward, terminated, truncated, info = self.env.step(action)
         
         # Add a safety cost when the angle is below horizontal
-        cost = np.where(state[:, 0] < -0.5, 1, 0)
+        cost = np.where(state[:, 0] < self.safety_threshold, 1, 0)
         
         return state, reward, cost, terminated, truncated, info
     
@@ -40,20 +43,19 @@ class SafePendulumWrapper(VectorEnvWrapper):
 
     def render(self):
         return self.env.render()    
+    
+    def get_safety_threshold(self):
+        return self.safety_threshold        
 
 class SafeCartPoleWrapper(VectorEnvWrapper):
-    def __init__(self, env, force_scale=10.0, safety_threshold=0.8):
-        super().__init__(env)
-        self.force_scale = force_scale  # Scale factor for force
-        
-        # Modify action space to be continuous
-        self.action_space = gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float64)        
+    def __init__(self, env, safety_threshold=0.8):
+        super().__init__(env)    
         self.safety_threshold = safety_threshold
 
     def step(self, action):
         state, reward, terminated, truncated, info = self.env.step(action)
         
-        # Add a safety cost when the car goes too far left
+        # Add a safety cost when the car goes beyond the bounded region
         cost = np.where(abs(state[:, 0]) > self.safety_threshold, 1, 0)
         
         return state, reward, cost, terminated, truncated, info
@@ -63,6 +65,9 @@ class SafeCartPoleWrapper(VectorEnvWrapper):
 
     def render(self):
         return self.env.render()     
+    
+    def get_safety_threshold(self):
+        return self.safety_threshold
 
 # Use the wrapper
 def create_envs(env_id, N, T):

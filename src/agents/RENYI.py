@@ -13,7 +13,6 @@ from tabulate import tabulate
 import matplotlib.pyplot as plt
 import os
 from src.discretizer import create_discretizer
-from src.policy import PolicyNetwork, train_supervised
 from src.value import ValueNetwork
 from src.vae import VAE, Encoder, Decoder, Prior
 
@@ -22,12 +21,12 @@ float_choice = torch.float64
 torch.set_default_dtype(float_choice)
 
 class RENYI:
-    def __init__(self, env_id, episode_nr, step_nr, heatmap_cmap, heatmap_labels, heatmap_interp,
+    def __init__(self, env_id, episode_nr, step_nr, heatmap_cmap, heatmap_interp,
                  parallel_envs=8, int_type=int_choice, float_type=float_choice, omega=3000,
-                 k=1, delta=1, max_off_iters=1, use_backtracking=True, backtrack_coeff=0, max_backtrack_try=0, 
-                 eps=1e-5, d=1, eta=1e-4, epsilon=0.2, alpha=1, beta=0, lambda_vae=1e-3, lambda_entropy_value=1e-3, 
+                 k=1, alpha=1, zeta=0, delta=1, max_off_iters=1, use_backtracking=True, backtrack_coeff=0, max_backtrack_try=0, 
+                 eps=1e-5, d=1, eta=1e-4, epsilon=0.2, lambda_vae=1e-3, lambda_entropy_value=1e-3, 
                  lambda_cost_value=1e-3, lambda_policy=1e-3, lambda_omega=1e-3, epoch_nr=500, 
-                 seed=None, out_path="", use_behavioral=False):    
+                 out_path="", use_behavioral=False, state_dependent_std=False):    
         """
         T: Number of trajectories/episodes
         N: Number of time steps
@@ -40,13 +39,14 @@ class RENYI:
         # == Environment Config ==
         self.env_id = env_id
         self.parallel_envs = parallel_envs
-        self.seed = seed
         self.out_path = out_path
         self.int_type = int_type
         self.float_type = float_type
 
         # == Algorithm Hyperparameters ==
         self.k = k
+        self.alpha = alpha
+        self.zeta = zeta
         self.delta = delta
         self.max_off_iters = max_off_iters
         self.use_backtracking = use_backtracking
@@ -66,14 +66,13 @@ class RENYI:
         self.omega = omega
         self.eta = eta
         self.epsilon = epsilon
-        self.alpha = alpha
-        self.beta = 0
         self.patience = 50
         self.use_behavioral = use_behavioral
 
         # == Environment State ==
         self.envs = None
         self.device = None
+        self.state_dependent_std = state_dependent_std
         self.is_discrete = False
         self.state_dim = 0
         self.action_dim = 0
@@ -92,52 +91,60 @@ class RENYI:
 
         # == Heatmap Settings ==
         self.heatmap_cmap = heatmap_cmap
-        self.heatmap_labels = heatmap_labels
         self.heatmap_interp = heatmap_interp
         self.heatmap_discretizer = None
+        if self.env_id == "MountainCarContinuous-v0" or self.env_id == "MountainCar-v0":
+            self.heatmap_labels = ('Position', 'Velocity')
+        elif self.env_id == "CartPole-v1":
+            self.heatmap_labels = ('Pole Angle', 'Cart Position')    
+        elif self.env_id == "Pendulum-v1":   
+            self.heatmap_labels = ('Cosine', 'Sine')             
+        else:
+            self.heatmap_labels = ('X', 'Y')          
 
     # Environment and Setup
     def create_policy(self, is_behavioral=False):
-        policy = PolicyNetwork(self.state_dim, self.action_dim, self.is_discrete, self.device).to(self.device)
+        policy = PolicyNetwork(self.state_dim, self.action_dim, self.state_dependent_std, self.is_discrete, self.device).to(self.device)
 
-        if is_behavioral:
-            policy = train_supervised(self.envs, policy, self.lambda_policy, self.device, train_steps=100)
+        # if is_behavioral and not self.is_discrete:
+        #     policy = train_supervised(self.envs, policy, self.lambda_policy, self.device, train_steps=100)
 
         return policy
 
-    def collect_particles(self, behavioral=True):
+    def collect_particles(self, epoch, behavioral=True):
         """
         Collects num_loops * parallel_envs episodes (particles) of trajectory data.
         Each loop collects one batch of trajectories in parallel across multiple environments.
         """
         states = np.zeros((self.episode_nr, self.step_nr + 1, self.state_dim), dtype=np.float32)
         if self.is_discrete:
-            actions = np.zeros((self.episode_nr, self.step_nr, self.action_dim), dtype=np.int32)
+            actions = np.zeros((self.episode_nr, self.step_nr), dtype=np.int32)
         else:
             actions = np.zeros((self.episode_nr, self.step_nr, self.action_dim), dtype=np.float32)
         costs = np.zeros((self.episode_nr, self.step_nr, 1), dtype=np.float32)
         next_states = np.zeros((self.episode_nr, self.step_nr, self.state_dim), dtype=np.float32)
+        stds_or_probs = np.zeros((self.episode_nr, self.step_nr, self.action_dim), dtype=np.float32)
 
         print("\nCollect particles")
         num_loops = self.episode_nr // self.parallel_envs
         for loop_idx in range(num_loops):
             # Reset the environments for this batch
-            s, _ = self.envs.reset()
+            s, _ = self.envs.reset(seed = epoch * self.episode_nr + loop_idx * self.parallel_envs)
 
             loop_offset = loop_idx * self.parallel_envs  # where to store this batch
             for t in tqdm(range(self.step_nr)):
                 # Sample action from policy
                 if behavioral:
-                    a = self.behavioral_policy.predict(s).cpu().numpy()
+                    a, std_or_prob = self.behavioral_policy.predict(s)
                 else:
-                    a = self.target_policy.predict(s).cpu().numpy()
-
-                if self.is_discrete:
-                    a = a.squeeze(-1)
+                    a, std_or_prob = self.target_policy.predict(s)
+                a = a.cpu().numpy()
+                std_or_prob = std_or_prob.cpu().numpy()    
 
                 # Record
                 states[loop_offset: loop_offset + self.parallel_envs, t] = s
                 actions[loop_offset: loop_offset + self.parallel_envs, t] = a
+                stds_or_probs[loop_offset: loop_offset + self.parallel_envs, t] = std_or_prob
 
                 # Step through environments
                 s, _, cost, _, _, _ = self.envs.step(a)
@@ -155,8 +162,9 @@ class RENYI:
             actions = torch.tensor(actions, dtype=self.float_type, device=self.device)
         costs = torch.tensor(costs, dtype=self.float_type, device=self.device)
         next_states = torch.tensor(next_states, dtype=self.float_type, device=self.device)
+        stds_or_probs = torch.tensor(stds_or_probs, dtype=self.float_type, device=self.device)
 
-        return states, actions, costs, next_states
+        return states, actions, costs, next_states, stds_or_probs
     
     def get_heatmap(self, title = None):
         """
@@ -171,16 +179,14 @@ class RENYI:
         print("\nGetting heatmap using vectorized environments...")
 
         num_loops = self.episode_nr // self.parallel_envs
-        for _ in tqdm(range(num_loops)):
+        for loop_nr in tqdm(range(num_loops)):
             # Reset all environments (batched)
-            s, _ = self.envs.reset()            
+            s, _ = self.envs.reset(seed = loop_nr * self.parallel_envs)              
             for t in tqdm(range(self.step_nr)):
                 # Convert states to tensor and predict actions
                 with torch.inference_mode():
-                    a = self.behavioral_policy.predict(s).cpu().numpy()  # Move actions to CPU for envs.step()
-
-                if self.is_discrete:
-                    a = a.squeeze(-1)
+                    a, _ = self.behavioral_policy.predict(s)
+                    a = a.cpu().numpy()
 
                 # Step all environments at once
                 s, _, _, _, _, _ = self.envs.step(a)
@@ -214,7 +220,7 @@ class RENYI:
             plt.bar([i for i in range(self.heatmap_discretizer.bins_sizes[0])], average_state_dist)
         
         # Safety constraint position in real world coordinates
-        safety_x_position = -1  # The x-value where the vertical line should be
+        safety_x_position = self.envs.get_safety_threshold()  # The x-value where the vertical line should be
 
         # Get x-axis bin edges from the discretizer
         x_bin_edges = self.heatmap_discretizer.bins[0]  # Assuming first dimension corresponds to x
@@ -233,15 +239,25 @@ class RENYI:
         return average_state_dist, average_entropy, image_fig
     
 
+    def _one_hot(self, a, scaling=5):
+        oh = nn.functional.one_hot(a, num_classes=self.action_dim).to(self.float_type)
+        return scaling * oh
+
     # Optimization and Evaluation
     def train_vae(self, states, actions, train=True):
+        # One-hot encode the actions if they are discrete
+        if self.is_discrete:
+            act_embed = self._one_hot(actions)
+        else:
+            act_embed = actions
+        
         # Stack state and action
-        sa_pairs = torch.cat([states[:, :-1, :], actions], dim=-1)  # shape (episodes, steps, state_dim+action_dim)
-        sa_pairs = sa_pairs.reshape(-1, self.state_dim + self.action_dim)
+        sa = torch.cat([states[:, : -1, :], act_embed], dim=-1)        
+        sa_flat = sa.reshape(-1, self.state_dim + self.action_dim)
 
         # VAE training
         batch_size = 256
-        dataset = torch.utils.data.TensorDataset(sa_pairs)
+        dataset = torch.utils.data.TensorDataset(sa_flat)
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
         print("\nTraining VAE...")
@@ -260,12 +276,19 @@ class RENYI:
         return vae_loss
         
     def compute_importance_weights(self, behavioral_policy, target_policy, states, actions):
+        if self.is_discrete:
+            actions = actions.unsqueeze(-1)
+
         # Log probabilities under both policies
         logp = target_policy.get_log_p(states[:, : -1], actions)
         old_logp = behavioral_policy.get_log_p(states[:, : -1], actions)
 
         # Compute importance ratio
         importance_weights = torch.exp(logp - old_logp)
+
+        if self.is_discrete:
+            importance_weights = importance_weights.view(-1)        
+        
         return importance_weights
 
     def compute_discounted_cost(self, costs):
@@ -287,9 +310,15 @@ class RENYI:
     def compute_entropy_reward(self, states, actions):
         print("\nCompute entropy using VAE")
         
-        # Use only up to timestep T (ignore final s_T+1)
-        sa = torch.cat([states[:, : -1], actions], dim=-1)  # shape: (episodes, steps, state_dim + action_dim)
-        sa_flat = sa.reshape(-1, self.state_dim + self.action_dim)  # flatten to shape (B*T, D)
+        # One-hot encode the actions if they are discrete
+        if self.is_discrete:
+            act_embed = self._one_hot(actions)
+        else:
+            act_embed = actions
+        
+        # Stack state and action
+        sa = torch.cat([states[:, : -1, :], act_embed], dim=-1)        
+        sa_flat = sa.reshape(-1, self.state_dim + self.action_dim)
 
         # Compute log-likelihood under VAE decoder
         with torch.inference_mode():
@@ -298,7 +327,8 @@ class RENYI:
 
             # Behavioral Entropy
             if self.use_behavioral:
-                entropy_reward = self.beta * torch.exp(-self.beta * ((-log_probs) ** self.alpha)) * ((-log_probs) ** self.alpha)
+                beta = np.exp((1 - self.alpha) * np.log(np.log(self.state_dim)))
+                entropy_reward = beta * torch.exp(-beta * ((-log_probs) ** self.alpha)) * ((-log_probs) ** self.alpha)
                 # # Behavioral entropy reward using distances between latent codes
                 # dists = torch.cdist(z, z, p=2)  # pairwise distances (B*T, B*T)
                 # sorted_dists, _ = torch.sort(dists, dim=1)
@@ -309,11 +339,11 @@ class RENYI:
                 # entropy_reward = entropy_reward.view(self.episode_nr, self.step_nr, 1)
             else:
                 # Convert to negative log-prob (entropy reward)
-                if self.alpha == 1:
+                if self.zeta == 1:
                     entropy_reward = -log_probs
                 else:
                     # Convert to estimated density: p(x) ≈ exp(log p(x | z))
-                    entropy_reward = torch.pow(torch.exp(log_probs) + self.eps, self.alpha - 1)
+                    entropy_reward = torch.pow(torch.exp(log_probs) + self.eps, self.zeta - 1)
             entropy_reward = entropy_reward.view(self.episode_nr, self.step_nr, 1)
         
         return entropy_reward
@@ -367,17 +397,22 @@ class RENYI:
         # Flatten for expected shape: (batch_size * T,)
         return advantage.view(-1)
 
-    def compute_policy_entropy(self, policy):
-        # Compute Shannon entropy over actions
-        entropy = 0.5 * self.action_dim * (1.0 + np.log(2 * np.pi)) + torch.sum(policy.log_std)
-        return entropy
-    
+    def compute_policy_entropy(self, stds_or_probs):    
+        if self.is_discrete:
+            # Probs are used here
+            entropy = -(stds_or_probs * torch.log(stds_or_probs + 1e-8)).sum(dim=-1)
+        else:
+            # Stds are used here
+            entropy = 0.5 * (1.0 + np.log(2 * np.pi)) * self.action_dim \
+                    + torch.log(stds_or_probs + 1e-8).sum(dim=-1)
+        return entropy.mean()
+
 
     # Logging
     def log_epoch_statistics(self, log_file, csv_file_1, csv_file_2, epoch, vae_loss, entropy_value_loss, 
                              cost_value_loss, policy_loss, safety_weight, value_lr, entropy_advantage,
                              cost_advantage, policy_entropy, mean_cost, std_cost, num_off_iters, execution_time,
-                            heatmap_image, heatmap_entropy, backtrack_iters, backtrack_lr):
+                             heatmap_image, heatmap_entropy, backtrack_iters, backtrack_lr):
         # Prepare tabulate table
         table = []
         fancy_float = lambda f : f"{f:.3f}"
@@ -434,19 +469,13 @@ class RENYI:
 
     def _initialize_envs(self):
         self.envs = create_envs(self.env_id, self.step_nr, self.parallel_envs)
-        self.heatmap_discretizer = create_discretizer(self.envs)
+        self.heatmap_discretizer = create_discretizer(self.envs, self.env_id)
         self.num_workers = min(os.cpu_count(), self.parallel_envs)
-        # # Seed everything
-        # if seed is not None:
-        #     # Seed everything
-        #     np.random.seed(self.seed)
-        #     torch.manual_seed(self.seed)
-        #     envs.seed(self.seed)  
         
         self.is_discrete = isinstance(self.envs.single_action_space, gymnasium.spaces.Discrete)
         self.state_dim = self.envs.single_observation_space.shape[0]
         if self.is_discrete:
-            self.action_dim = 1
+            self.action_dim = self.envs.single_action_space.n
         else:
             self.action_dim = self.envs.single_action_space.shape[0]        
 
@@ -539,7 +568,7 @@ class RENYI:
         t0 = time.time()
 
         # Entropy
-        states, actions, costs, next_states = self.collect_particles()
+        states, actions, costs, next_states, stds_or_probs = self.collect_particles(0)
 
         with torch.inference_mode():
             vae_loss = self.train_vae(states, actions, False)
@@ -561,7 +590,7 @@ class RENYI:
             cost_advantage = self.compute_cost_advantage(states, costs)
             cost_advantage_loss = torch.mean(cost_advantage.view(-1) * importance_weights)
 
-            policy_entropy = self.compute_policy_entropy(self.behavioral_policy)
+            policy_entropy = self.compute_policy_entropy(stds_or_probs)
 
             policy_loss = -entropy_advantage_loss + self.omega * cost_advantage_loss - self.eta * policy_entropy
 
@@ -632,7 +661,7 @@ class RENYI:
             num_off_iters = 0
 
             # Collect particles to optimize off policy
-            states, actions, costs, next_states = self.collect_particles()
+            states, actions, costs, next_states, stds_or_probs = self.collect_particles(epoch)
 
             if self.use_backtracking:
                 self.lambda_policy = original_lr
@@ -686,7 +715,7 @@ class RENYI:
             cost_advantage = self.compute_cost_advantage(states, costs)
             cost_advantage_loss = torch.mean(cost_advantage.view(-1) * importance_weights)
 
-            policy_entropy = self.compute_policy_entropy(self.behavioral_policy)
+            policy_entropy = self.compute_policy_entropy(stds_or_probs)
 
             # Update policy network
             self.policy_optimizer.zero_grad()
@@ -769,7 +798,7 @@ class RENYI:
         for model_link, title_txt in zip(model_lst, title_lst):
             # Create a behavioral, a target policy and a tmp policy used to save valid target policies
             # (those with kl <= kl_threshold) during off policy opt
-            self.behavioral_policy = PolicyNetwork(self.state_dim, self.action_dim, self.is_discrete, self.device)  # Recreate the model architecture
+            self.behavioral_policy = PolicyNetwork(self.state_dim, self.action_dim, self.state_dependent_std, self.is_discrete, self.device)  # Recreate the model architecture
             self.behavioral_policy.load_state_dict(torch.load(model_link))
             self.behavioral_policy.to(self.device)  # Move model to the correct device (CPU/GPU)
             self.behavioral_policy.eval()  # Set to evaluation mode (disables dropout, batch norm, etc.)

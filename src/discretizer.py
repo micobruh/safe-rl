@@ -9,7 +9,7 @@ class Discretizer:
         self.feature_ranges = features_ranges
         self.bins_sizes = bins_sizes
 
-        self.bins = [np.linspace(features_ranges[i][0], features_ranges[i][1], bins_sizes[i]+1)[1:-1] for i in range(self.num_features)]
+        self.bins = [np.linspace(features_ranges[i][0], features_ranges[i][1], bins_sizes[i] + 1)[1: -1] for i in range(self.num_features)]
 
         self.lambda_transform = lambda_transform
 
@@ -24,13 +24,18 @@ class Discretizer:
     def get_empty_mat(self):
         return np.zeros(self.bins_sizes)
 
-def create_discretizer(envs, num_bins=40, transform_fn=lambda s: [s[0], s[1]]):
+def create_discretizer(envs, env_id, num_bins=40):
     """
     Creates a Discretizer object for a given Safety Gymnasium environment.
     """
+    if env_id == 'CartPole-v1':
+        state_idxs = [2, 0]
+    else:    
+        state_idxs = [0, 1]
+
     # Get state space limits
-    state_low = envs.single_observation_space.low[: 2]
-    state_high = envs.single_observation_space.high[: 2]
+    state_low = envs.single_observation_space.low[state_idxs]
+    state_high = envs.single_observation_space.high[state_idxs]
 
     # Ensure valid finite values (replace -inf/inf with reasonable bounds)
     state_low = np.where(state_low == -np.inf, -10, state_low)
@@ -44,6 +49,7 @@ def create_discretizer(envs, num_bins=40, transform_fn=lambda s: [s[0], s[1]]):
         bins_sizes = [num_bins] * len(features_ranges)
     else:
         bins_sizes = num_bins  # Custom bin sizes per feature
+    transform_fn = lambda s: [s[state_idxs[0]], s[state_idxs[1]]]           
 
     # Create Discretizer
     discretizer = Discretizer(features_ranges, bins_sizes, lambda_transform=transform_fn)
