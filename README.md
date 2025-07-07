@@ -4,7 +4,7 @@
 
 The python environment should not be 3.11 or higher due to pygame compatibility (Used in Safety-Gymnasium package).
 
-We recommend using python 3.9.
+It is recommended to use Python 3.9.
 
 Code to initialize environment (Replace <safe_env> with the actual environment name):
 ```
@@ -79,4 +79,4 @@ Then, install pycuda:
 pip install pycuda
 ```
 
-If the device shows "cuda:0" is an option, then this works
+If the device shows "cuda:0" is an option, then this works.
