@@ -12,14 +12,19 @@ float_choice = torch.float64
 torch.set_default_dtype(float_choice)
 
 class CEM(BaseAgent):
-    def __init__(self, *args, max_off_iters=1, backtrack_coeff=0, max_backtrack_try=0, **kwargs):    
+    def __init__(self, *args, **kwargs):    
         super().__init__(*args, **kwargs)
 
         # == Algorithm Hyperparameters ==
-        self.max_off_iters = max_off_iters
-        self.backtrack_coeff = backtrack_coeff
-        self.max_backtrack_try = max_backtrack_try
-
+        self.max_off_iters = 30
+        self.backtrack_coeff = 2
+        self.max_backtrack_try = 10
+        if self.env_id == "MountainCarContinuous-v0" or self.env_id == "MountainCar-v0" or "CartPole-v1" or "Pendulum-v1":
+            self.trust_region_threshold = 0.5
+        else:
+            self.trust_region_threshold = 0.1
+        self.alg_name = "CEM"    
+  
     # Optimization and Evaluation
     def compute_kl(self, behavioral_policy, target_policy, states, actions, indices):
         importance_weights = self.compute_importance_weights(behavioral_policy, target_policy, states, actions)
@@ -42,7 +47,7 @@ class CEM(BaseAgent):
 
         # Maximize entropy
         mean_entropy, std_entropy = self.compute_entropy(distances, indices, self.use_behavioral, self.zeta, importance_weights)
-        loss = -mean_entropy + self.omega * cost_advantage_loss
+        loss = -mean_entropy + self.safety_weight * cost_advantage_loss
 
         numeric_error = torch.isinf(loss) or torch.isnan(loss)
 
@@ -118,11 +123,11 @@ class CEM(BaseAgent):
         last_valid_target_policy.load_state_dict(self.behavioral_policy.state_dict())
 
         # Set optimizer for policy
-        self.policy_optimizer = torch.optim.Adam(self.target_policy.parameters(), lr = self.lambda_policy)
+        self.policy_optimizer = torch.optim.Adam(self.target_policy.parameters(), lr = self.policy_lr)
 
         # Initialize value neural network
         self.cost_value_nn = ValueNetwork(self.state_dim, self.device).to(self.device)
-        self.cost_value_optimizer = torch.optim.Adam(self.cost_value_nn.parameters(), lr = self.lambda_cost_value)
+        self.cost_value_optimizer = torch.optim.Adam(self.cost_value_nn.parameters(), lr = self.cost_value_lr)
 
         return last_valid_target_policy       
 
@@ -162,7 +167,7 @@ class CEM(BaseAgent):
             cost_value_loss = self.compute_cost_advantage(states, costs, True)
             cost_advantage = self.compute_cost_advantage(states, costs)
             cost_advantage_loss = torch.mean(cost_advantage.view(-1) * importance_weights)     
-            policy_loss = -mean_entropy + self.omega * cost_advantage_loss                 
+            policy_loss = -mean_entropy + self.safety_weight * cost_advantage_loss                 
 
         print("\nEntropy computed")
 
@@ -181,17 +186,14 @@ class CEM(BaseAgent):
         torch.save(self.behavioral_policy.state_dict(), os.path.join(self.out_path, "0-policy.pt"))
         torch.save(self.cost_value_nn.state_dict(), os.path.join(self.out_path, "0-cost-value.pt"))
 
-        safety_weight = self.omega
-        value_lr = self.lambda_cost_value
-
         # Log statistics for the initial policy
         self.log_epoch_statistics(
             log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
             epoch=0,
             cost_value_loss=cost_value_loss,
             policy_loss=policy_loss,
-            safety_weight=safety_weight,
-            value_lr=value_lr,
+            safety_weight=self.safety_weight,
+            value_lr=self.cost_value_lr,
             cost_advantage=cost_advantage_loss,
             mean_entropy=mean_entropy,
             std_entropy=std_entropy,
@@ -232,12 +234,12 @@ class CEM(BaseAgent):
 
             kl = kl.cpu().numpy()
 
-            if not numeric_error and not kl_numeric_error and kl <= self.delta:
+            if not numeric_error and not kl_numeric_error and kl <= self.trust_region_threshold:
                 # Valid update
                 last_valid_target_policy.load_state_dict(self.target_policy.state_dict())
                 num_off_iters += 1
                 global_num_off_iters += 1
-                lr = self.lambda_policy
+                lr = self.policy_lr
                 # Log statistics for this off policy iteration
                 self.log_off_iter_statistics(csv_file_3, epoch, num_off_iters - 1, global_num_off_iters - 1,
                                              loss, cost_advantage_loss, mean_entropy, std_entropy, kl, 
@@ -250,10 +252,10 @@ class CEM(BaseAgent):
                     if not backtrack_iter == self.max_backtrack_try:
                         self.target_policy.load_state_dict(last_valid_target_policy.state_dict())
 
-                        self.lambda_policy = original_lr / (self.backtrack_coeff ** backtrack_iter)
+                        self.policy_lr = original_lr / (self.backtrack_coeff ** backtrack_iter)
 
                         for param_group in self.policy_optimizer.param_groups:
-                            param_group['lr'] = self.lambda_policy
+                            param_group['lr'] = self.policy_lr
 
                         backtrack_iter += 1
                         continue
@@ -274,7 +276,7 @@ class CEM(BaseAgent):
     
     def _epoch_train(self, cost_value_loss, policy_loss, last_valid_target_policy, log_file, csv_file_1, csv_file_2, csv_file_3, heatmap_entropy, heatmap_cost, heatmap_image):
         if self.use_backtracking:
-            original_lr = self.lambda_policy
+            original_lr = self.policy_lr
 
         best_cost_value_loss = cost_value_loss
         best_loss = policy_loss
@@ -295,17 +297,18 @@ class CEM(BaseAgent):
                 self.collect_particles_and_compute_knn(epoch - 1)
 
             if self.use_backtracking:
-                self.lambda_policy = original_lr
+                self.policy_lr = original_lr
 
                 for param_group in self.policy_optimizer.param_groups:
-                    param_group['lr'] = self.lambda_policy
+                    param_group['lr'] = self.policy_lr
 
                 backtrack_iter = 1
             else:
                 backtrack_iter = None
 
-            # Update safety weight (omega)
-            self.omega = max(0, self.omega + self.lambda_omega * (torch.sum(costs) / self.episode_nr - self.d))
+            # Update safety weight
+            self.safety_weight = max(0, self.safety_weight + self.safety_weight_lr * 
+                                     (torch.sum(costs) / self.episode_nr - self.safety_constraint))
             mean_behavorial_costs, std_behavorial_costs = self.compute_discounted_cost(costs)
 
             # Update value network
@@ -336,15 +339,11 @@ class CEM(BaseAgent):
                 self.behavioral_policy.load_state_dict(last_valid_target_policy.state_dict())
                 self.target_policy.load_state_dict(last_valid_target_policy.state_dict())
 
-                loss = (-mean_entropy + self.omega * cost_advantage_loss).cpu().numpy()
+                loss = (-mean_entropy + self.safety_weight * cost_advantage_loss).cpu().numpy()
                 mean_entropy = mean_entropy.cpu().numpy()
                 std_entropy = std_entropy.cpu().numpy()
                 mean_cost, std_cost = self.compute_discounted_cost(costs)
                 execution_time = time.time() - t0
-
-                backtrack_lr = self.lambda_policy
-                safety_weight = self.omega
-                value_lr = self.lambda_cost_value
 
                 # Log statistics for the initial policy
                 self.log_epoch_statistics(
@@ -352,8 +351,8 @@ class CEM(BaseAgent):
                     epoch=epoch,
                     cost_value_loss=cost_value_loss,
                     policy_loss=loss,
-                    safety_weight=safety_weight,
-                    value_lr=value_lr,
+                    safety_weight=self.safety_weight,
+                    value_lr=self.cost_value_lr,
                     cost_advantage=cost_advantage_loss,
                     mean_entropy=mean_entropy,
                     std_entropy=std_entropy,
@@ -390,6 +389,10 @@ class CEM(BaseAgent):
 
         best_epoch = self._epoch_train(cost_value_loss, policy_loss, last_valid_target_policy, log_file, csv_file_1, csv_file_2, csv_file_3, heatmap_entropy, heatmap_cost, heatmap_image)                                                                
         heatmap_entropy, heatmap_cost, heatmap_image = self._plot_heatmap(best_epoch)
+
+        if self.env_id == "Pendulum-v1" or self.env_id == "MountainCarContinuous-v0":
+            self.visualize_policy_comparison()    
+            self.visualize_policy_heatmap(False)     
 
         if isinstance(self.envs, gymnasium.vector.VectorEnv) or isinstance(self.envs, safety_gymnasium.vector.VectorEnv):
             self.envs.close()

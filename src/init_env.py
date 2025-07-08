@@ -4,7 +4,7 @@ import numpy as np
 from gymnasium.vector import VectorEnvWrapper
 
 class SafeMountainCarWrapper(VectorEnvWrapper):
-    def __init__(self, env, safety_threshold=-0.8):
+    def __init__(self, env, safety_threshold=-0.9):
         super().__init__(env)
         self.safety_threshold = safety_threshold
 
@@ -26,15 +26,16 @@ class SafeMountainCarWrapper(VectorEnvWrapper):
         return self.safety_threshold    
     
 class SafePendulumWrapper(VectorEnvWrapper):
-    def __init__(self, env, safety_threshold=-0.5):
+    def __init__(self, env, safety_threshold_1=0, safety_threshold_2=2):
         super().__init__(env)      
-        self.safety_threshold = safety_threshold
+        self.safety_threshold_1 = safety_threshold_1
+        self.safety_threshold_2 = safety_threshold_2
 
     def step(self, action):
         state, reward, terminated, truncated, info = self.env.step(action)
         
-        # Add a safety cost when the angle is below horizontal
-        cost = np.where(state[:, 0] < self.safety_threshold, 1, 0)
+        # Add a safety cost when the pendulum swings too low and its angular velocity is too fast
+        cost = np.where((state[:, 0] < self.safety_threshold_1) & (np.abs(state[:, 2]) > self.safety_threshold_2), 1, 0)
         
         return state, reward, cost, terminated, truncated, info
     
@@ -45,10 +46,10 @@ class SafePendulumWrapper(VectorEnvWrapper):
         return self.env.render()    
     
     def get_safety_threshold(self):
-        return self.safety_threshold        
+        return self.safety_threshold_1, self.safety_threshold_2       
 
 class SafeCartPoleWrapper(VectorEnvWrapper):
-    def __init__(self, env, safety_threshold=1.2):
+    def __init__(self, env, safety_threshold=0.8):
         super().__init__(env)    
         self.safety_threshold = safety_threshold
 

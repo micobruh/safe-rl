@@ -1,5 +1,4 @@
 import numpy as np
-import safety_gymnasium
 
 class Discretizer:
     def __init__(self, features_ranges, bins_sizes, lambda_transform=None):
@@ -29,6 +28,8 @@ def create_discretizer(envs, env_id, num_bins=40):
     """
     if env_id == 'CartPole-v1':
         state_idxs = [2, 0]
+    elif env_id == 'Pendulum-v1':
+        state_idxs = [0, 2]    
     else:    
         state_idxs = [0, 1]
 

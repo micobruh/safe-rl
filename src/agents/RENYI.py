@@ -15,15 +15,18 @@ float_choice = torch.float64
 torch.set_default_dtype(float_choice)
 
 class RENYI(BaseAgent):
-    def __init__(self, *args, eta=1e-4, epsilon=0.2, lambda_vae=1e-3, lambda_entropy_value=1e-3, lambda_omega=1e-3, **kwargs):    
+    def __init__(self, *args, **kwargs):    
         super().__init__(*args, **kwargs) 
 
         # == Algorithm Hyperparameters ==
-        self.lambda_vae = lambda_vae
-        self.lambda_entropy_value = lambda_entropy_value
-        self.lambda_omega = lambda_omega
-        self.eta = eta
-        self.epsilon = epsilon
+        if self.env_id == "MountainCarContinuous-v0" or self.env_id == "MountainCar-v0" or "CartPole-v1" or "Pendulum-v1":
+            self.vae_lr = 1e-3
+        else:
+            self.vae_lr = 1e-4    
+        self.entropy_value_lr = 1e-3
+        self.eta = 1e-4
+        self.epsilon = 0.2
+        self.alg_name = "RENYI"
 
         # == Neural Networks ==
         self.cost_value_nn = None
@@ -229,14 +232,14 @@ class RENYI(BaseAgent):
         # Initialize entropy value neural network
         self.entropy_value_nn = ValueNetwork(self.state_dim, self.device).to(self.device)
         self.entropy_value_optimizer = torch.optim.Adam(self.entropy_value_nn.parameters(), 
-                                                        lr = self.lambda_entropy_value) 
+                                                        lr = self.entropy_value_lr) 
 
         # Initialize cost value neural network
         self.cost_value_nn = ValueNetwork(self.state_dim, self.device).to(self.device)
-        self.cost_value_optimizer = torch.optim.Adam(self.cost_value_nn.parameters(), lr = self.lambda_cost_value)       
+        self.cost_value_optimizer = torch.optim.Adam(self.cost_value_nn.parameters(), lr = self.cost_value_lr)       
 
         # Set optimizer for policy
-        self.policy_optimizer = torch.optim.Adam(self.target_policy.parameters(), lr = self.lambda_policy)
+        self.policy_optimizer = torch.optim.Adam(self.target_policy.parameters(), lr = self.policy_lr)
 
         # Initialize VAE neural network
         D = self.state_dim + self.action_dim
@@ -265,7 +268,7 @@ class RENYI(BaseAgent):
         self.vae.decoder.to(self.device)
         self.vae.prior.to(self.device)        
         self.vae.to(self.device)
-        self.vae_optimizer = torch.optim.Adam(self.vae.parameters(), lr=self.lambda_vae)           
+        self.vae_optimizer = torch.optim.Adam(self.vae.parameters(), lr=self.vae_lr)           
 
     def _initialize_logging(self):
         # Create log files
@@ -309,6 +312,7 @@ class RENYI(BaseAgent):
             
             importance_weights = self.compute_reward_importance_weights(self.behavioral_policy, self.behavioral_policy, states, actions)
             entropy_advantage = self.compute_entropy_advantage(states, entropy_reward)
+            
             # Clip the advantage as per PPO
             clipped_adv = torch.where(
                 entropy_advantage >= 0,
@@ -323,7 +327,7 @@ class RENYI(BaseAgent):
 
             policy_entropy = self.compute_policy_entropy(stds_or_probs)
 
-            policy_loss = -entropy_advantage_loss + self.omega * cost_advantage_loss - self.eta * policy_entropy
+            policy_loss = -entropy_advantage_loss + self.safety_weight * cost_advantage_loss - self.eta * policy_entropy
 
         print("\nEntropy computed")
 
@@ -345,9 +349,6 @@ class RENYI(BaseAgent):
         torch.save(self.entropy_value_nn.state_dict(), os.path.join(self.out_path, "0-entropy-value.pt"))
         torch.save(self.cost_value_nn.state_dict(), os.path.join(self.out_path, "0-cost-value.pt"))
 
-        safety_weight = self.omega
-        value_lr = self.lambda_cost_value
-
         # Log statistics for the initial policy
         self.log_epoch_statistics(
             log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
@@ -356,8 +357,8 @@ class RENYI(BaseAgent):
             entropy_value_loss=entropy_value_loss,
             cost_value_loss=cost_value_loss,
             policy_loss=policy_loss,
-            safety_weight=safety_weight,
-            value_lr=value_lr,
+            safety_weight=self.safety_weight,
+            value_lr=self.cost_value_lr,
             entropy_advantage=entropy_advantage_loss,
             cost_advantage=cost_advantage_loss,
             policy_entropy=policy_entropy,
@@ -376,7 +377,7 @@ class RENYI(BaseAgent):
     
     def _epoch_train(self, vae_loss, entropy_value_loss, cost_value_loss, policy_loss, log_file, csv_file_1, csv_file_2, heatmap_entropy, heatmap_cost, heatmap_image):
         if self.use_backtracking:
-            original_lr = self.lambda_policy
+            original_lr = self.policy_lr
 
         best_vae_loss = vae_loss
         best_cost_value_loss = cost_value_loss
@@ -405,10 +406,10 @@ class RENYI(BaseAgent):
             stds_or_probs = torch.tensor(stds_or_probs, dtype=self.float_type, device=self.device)            
 
             if self.use_backtracking:
-                self.lambda_policy = original_lr
+                self.policy_lr = original_lr
 
                 for param_group in self.policy_optimizer.param_groups:
-                    param_group['lr'] = self.lambda_policy
+                    param_group['lr'] = self.policy_lr
 
                 backtrack_iter = 1
             else:
@@ -429,8 +430,9 @@ class RENYI(BaseAgent):
             if entropy_value_loss < best_entropy_value_loss:
                 torch.save(self.entropy_value_nn.state_dict(), os.path.join(self.out_path, f"{epoch}-entropy-value.pt"))            
 
-            # Update safety weight (omega)
-            self.omega = max(0, self.omega + self.lambda_omega * (torch.sum(costs) / self.episode_nr - self.d))
+            # Update safety weight
+            self.safety_weight = max(0, self.safety_weight + self.safety_weight_lr * 
+                                     (torch.sum(costs) / self.episode_nr - self.safety_constraint))
             # mean_behavorial_costs, std_behavorial_costs = self.compute_discounted_cost(costs)
 
             # Update cost value network
@@ -460,7 +462,7 @@ class RENYI(BaseAgent):
 
             # Update policy network
             self.policy_optimizer.zero_grad()
-            loss = -entropy_advantage_loss + self.omega * cost_advantage_loss - self.eta * policy_entropy
+            loss = -entropy_advantage_loss + self.safety_weight * cost_advantage_loss - self.eta * policy_entropy
             loss.backward()
             self.policy_optimizer.step()
             loss = loss.detach().cpu().numpy()
@@ -468,9 +470,6 @@ class RENYI(BaseAgent):
             mean_cost, std_cost = self.compute_discounted_cost(costs)
             execution_time = time.time() - t0
 
-            backtrack_lr = self.lambda_policy
-            safety_weight = self.omega
-            value_lr = self.lambda_cost_value
             # Log statistics for the initial policy
             self.log_epoch_statistics(
                 log_file=log_file, csv_file_1=csv_file_1, csv_file_2=csv_file_2,
@@ -479,8 +478,8 @@ class RENYI(BaseAgent):
                 entropy_value_loss=entropy_value_loss,
                 cost_value_loss=cost_value_loss,
                 policy_loss=policy_loss,
-                safety_weight=safety_weight,
-                value_lr=value_lr,
+                safety_weight=self.safety_weight,
+                value_lr=self.cost_value_lr,
                 entropy_advantage=entropy_advantage_loss,
                 cost_advantage=cost_advantage_loss,
                 policy_entropy=policy_entropy,
@@ -520,6 +519,10 @@ class RENYI(BaseAgent):
 
         best_epoch = self._epoch_train(vae_loss, entropy_value_loss, cost_value_loss, policy_loss, log_file, csv_file_1, csv_file_2, heatmap_entropy, heatmap_cost, heatmap_image)                                                                
         heatmap_entropy, heatmap_cost, heatmap_image = self._plot_heatmap(best_epoch)
+
+        if self.env_id == "Pendulum-v1" or self.env_id == "MountainCarContinuous-v0":
+            self.visualize_policy_comparison()   
+            self.visualize_policy_heatmap(False)      
 
         if isinstance(self.envs, gymnasium.vector.VectorEnv) or isinstance(self.envs, safety_gymnasium.vector.VectorEnv):
             self.envs.close()
