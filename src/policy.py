@@ -42,25 +42,13 @@ class PolicyNetwork(nn.Module):
         nn.init.xavier_uniform_(self.mean_head.weight)
         if self.state_dependent_std:
             nn.init.xavier_uniform_(self.log_std_head.weight)
-            nn.init.constant_(self.log_std_head.bias, -0.5)
+            nn.init.constant_(self.log_std_head.bias, 0.5)
 
         for layer in self.net:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
 
     def get_log_p(self, states, actions):
-        # mean, _ = self(states)
-        # if self.is_discrete:
-        #     log_mean = torch.log(mean + self.eps)
-        #     return log_mean.gather(1, actions).squeeze(-1)
-        # else:
-        #     return torch.sum(
-        #         -0.5 * (
-        #             self.log_of_two_pi
-        #             + 2 * self.log_std
-        #             + ((actions - mean) ** 2 / (torch.exp(self.log_std) + self.eps) ** 2)
-        #         ), dim = 1
-        #     )
         if self.is_discrete:
             logits, _ = self(states)
             log_probs = torch.log_softmax(logits, dim=-1)
