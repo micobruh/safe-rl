@@ -49,7 +49,7 @@ class SafePendulumWrapper(VectorEnvWrapper):
         return self.safety_threshold_1, self.safety_threshold_2       
 
 class SafeCartPoleWrapper(VectorEnvWrapper):
-    def __init__(self, env, safety_threshold=0.8):
+    def __init__(self, env, safety_threshold=1.5):
         super().__init__(env)    
         self.safety_threshold = safety_threshold
 

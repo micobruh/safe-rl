@@ -9,17 +9,27 @@ import scipy
 import scipy.special
 from src.init_env import create_envs
 from src.policy import PolicyNetwork, train_supervised
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+import seaborn as sns
 import os
 from src.discretizer import create_discretizer
+from sklearn.manifold import TSNE
+import matplotlib.lines as mlines
+import pandas as pd
+import re
+from pathlib import Path
 
 int_choice = torch.int64
 float_choice = torch.float64
 torch.set_default_dtype(float_choice)
+np.random.seed(0)
+torch.manual_seed(0)
 
 class BaseAgent:
-    def __init__(self, env_id, alpha=0, zeta=1, epoch_nr=500, use_behavioral=False, state_dependent_std=False, out_path=""):    
+    def __init__(self, env_id, safety_weight=6000, alpha=0, zeta=1, epoch_nr=500, use_behavioral=False, state_dependent_std=False, out_path=""):    
         """
         k: Number of neighbors
         alpha: Parameter used in Behavioral entropy
@@ -38,14 +48,14 @@ class BaseAgent:
         self.alpha = alpha
         self.zeta = zeta
         self.use_backtracking = True
-        self.safety_weight = 0      
+        self.safety_weight = safety_weight     
         self.cost_value_lr = 1e-3
         self.safety_weight_lr = 1e-2
         if self.env_id == "MountainCarContinuous-v0" or self.env_id == "MountainCar-v0":
             self.step_nr = 400
             self.policy_lr = 1e-4
             self.safety_constraint = 0.5
-        elif self.env_id == "CartPole-v1" or "Pendulum-v1":
+        elif self.env_id == "CartPole-v1" or self.env_id == "Pendulum-v1":
             self.step_nr = 300
             self.policy_lr = 1e-4
             self.safety_constraint = 5
@@ -61,11 +71,19 @@ class BaseAgent:
         self.use_behavioral = use_behavioral
         self.alg_name = ""
         if use_behavioral:
-            self.entropy_name = f"Behavioral Entropy ($\alpha=${self.alpha})"
-        elif self.zeta == 0:
+            self.entropy_name = fr"Behavioral Entropy ($\alpha={self.alpha}$)"
+        elif self.zeta == 1:
             self.entropy_name = f"Shannon Entropy"
         else:
-            self.entropy_name = f"Rényi Entropy ($\zeta=${self.zeta})"
+            self.entropy_name = fr"Rényi Entropy ($\zeta={self.zeta}$)"
+        self.max_off_iters = 30
+        self.backtrack_coeff = 2
+        self.max_backtrack_try = 10
+        if self.env_id == "MountainCarContinuous-v0" or self.env_id == "MountainCar-v0" or "CartPole-v1" or "Pendulum-v1":
+            self.trust_region_threshold = 0.5
+        else:
+            self.trust_region_threshold = 0.1            
+            
         # == Environment State ==
         self.envs = None
         self.device = None
@@ -82,7 +100,9 @@ class BaseAgent:
         self.target_policy = None
         self.cost_value_nn = None
         self.policy_optimizer = None
+        self.policy_scheduler = None
         self.cost_value_optimizer = None
+        self.cost_value_scheduler = None
 
         # == Heatmap Settings ==
         self.heatmap_cmap = 'Blues'
@@ -99,15 +119,51 @@ class BaseAgent:
 
 
     # Environment and Setup
-    def create_policy(self, is_behavioral=False):
+    def create_policy(self):
         first_layer_neuron = 400 if self.env_id == "SafetyPointGoal1-v0" else 300
         second_layer_neuron = 300
         policy = PolicyNetwork(self.state_dim, self.action_dim, first_layer_neuron, second_layer_neuron, self.state_dependent_std, self.is_discrete, self.device).to(self.device)
-
-        # if is_behavioral and not self.is_discrete:
-        #     policy = train_supervised(self.envs, policy, self.policy_lr, self.device, train_steps=100)
-
         return policy
+    
+    def normalize_states(self, states):
+        is_tensor = isinstance(states, torch.Tensor)
+        states_np = states.cpu().numpy() if is_tensor else states
+
+        obs_low = self.envs.single_observation_space.low
+        obs_high = self.envs.single_observation_space.high
+
+        # Robust check for boundedness
+        finite_low = np.isfinite(obs_low)
+        finite_high = np.isfinite(obs_high)
+
+        bounded = finite_low & finite_high
+        lower_bounded = finite_low & ~finite_high
+        upper_bounded = ~finite_low & finite_high
+        unbounded = ~finite_low & ~finite_high
+
+        norm_states = np.zeros_like(states_np)
+
+        # Fully bounded: Min-Max scaling to [-1, 1]
+        norm_states[..., bounded] = 2 * (states_np[..., bounded] - obs_low[bounded]) / \
+            np.maximum(obs_high[bounded] - obs_low[bounded], self.eps) - 1
+
+        # Lower bounded only
+        norm_states[..., lower_bounded] = states_np[..., lower_bounded] - obs_low[lower_bounded]
+
+        # Upper bounded only
+        norm_states[..., upper_bounded] = obs_high[upper_bounded] - states_np[..., upper_bounded]
+
+        # Unbounded: Standardize
+        if unbounded.any():
+            mean = np.mean(states_np[..., unbounded], axis=0, keepdims=True)
+            std = np.std(states_np[..., unbounded], axis=0, keepdims=True)
+            std[std < self.eps] = 1.0  # Avoid division by very small std
+            norm_states[..., unbounded] = (states_np[..., unbounded] - mean) / std
+
+        # Handle any remaining NaNs (e.g. from infs or divisions)
+        norm_states = np.nan_to_num(norm_states, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return torch.tensor(norm_states, dtype=states.dtype, device=states.device) if is_tensor else norm_states
 
     def collect_particles(self, epoch, state_dist=None):
         """
@@ -171,7 +227,7 @@ class BaseAgent:
 
         # Fit kNN for state density estimation
         reshaped_next_states = next_states.reshape(-1, self.state_dim)  # (num_samples, state_dim)
-        nbrs = NearestNeighbors(n_neighbors = self.k + 1, metric = 'euclidean', algorithm = 'auto', n_jobs = self.num_workers)
+        nbrs = NearestNeighbors(n_neighbors=self.k + 1, metric='euclidean', algorithm='auto', n_jobs=self.num_workers)
         nbrs.fit(reshaped_next_states)
         distances, indices = nbrs.kneighbors(reshaped_next_states)
         print("\nCompute KNN finishes")
@@ -197,7 +253,7 @@ class BaseAgent:
     def compute_importance_weights(self, behavioral_policy, target_policy, states, actions, same_policy=False):
         # Skip computation if the same policies are used
         if same_policy:
-            num_samples = self.episode_nr * self.step_nr
+            num_samples = states.shape[0] * self.step_nr
             importance_weights = torch.ones(num_samples, dtype=self.float_type, device=self.device)
             importance_weights /= num_samples
             return importance_weights
@@ -208,7 +264,7 @@ class BaseAgent:
         # Compute the importance weights
         # build iw vector incrementally from trajectory particles
         print("\nCompute importance weights")
-        for episode in tqdm(range(self.episode_nr)):
+        for episode in tqdm(range(states.shape[0])):
             # Last state (terminal) is discarded to match the action length
             traj_states = states[episode, : -1]
             traj_actions = actions[episode]
@@ -229,15 +285,23 @@ class BaseAgent:
         # Normalize the weights
         importance_weights /= torch.sum(importance_weights)
         return importance_weights
-
+        
     def compute_entropy(self, distances, indices, use_behavioral, zeta, importance_weights):
         if use_behavioral:
             # Behavioral Entropy
-            beta = np.exp((1 - self.alpha) * np.log(np.log(self.state_dim)))
             Rk = distances[:, self.k]
-            log_term = torch.log(Rk + self.eps)
-            entropy = Rk * torch.exp(-beta * (log_term ** self.alpha)) * (log_term ** self.alpha)
-            entropy_per_episode = entropy.view(self.episode_nr, self.step_nr)            
+            log_Rk = torch.log(Rk + self.eps)
+            term = torch.abs(self.state_dim * log_Rk)
+
+            beta = torch.exp((1 - self.alpha) * torch.log(torch.log(torch.tensor(float(self.state_dim)))))
+
+            entropy = torch.pow(Rk, self.state_dim) * \
+                    torch.exp(-beta * torch.pow(term, self.alpha)) * \
+                    torch.pow(term, self.alpha)
+
+            importance_weights = 1.0 / (Rk ** self.state_dim + self.eps)
+            weighted_entropy = importance_weights * entropy
+            entropy_per_episode = weighted_entropy.view(self.episode_nr, self.step_nr)            
         else:
             weights_sum = torch.sum(importance_weights[indices[:, : -1]], dim=1)
             volumes = (torch.pow(distances[:, self.k], self.state_dim) *
@@ -252,9 +316,8 @@ class BaseAgent:
             else:
                 density_estimate = weights_sum / (volumes + self.eps)
                 density_estimate = density_estimate.view(self.episode_nr, self.step_nr)
-                entropy_per_episode = (1.0 / (1.0 - self.zeta)) * torch.log(
-                    torch.sum(density_estimate ** self.zeta, dim=1) + self.eps
-                )
+                log_terms = (self.zeta - 1) * torch.log(density_estimate + self.eps)
+                entropy_per_episode = (1 / (1 - self.zeta)) * torch.logsumexp(log_terms, dim=1)
 
         mean_entropy = torch.mean(entropy_per_episode)
         std_entropy = torch.std(entropy_per_episode, unbiased=False)
@@ -272,110 +335,86 @@ class BaseAgent:
         discounted_costs = torch.sum(costs * discount_factors, dim=1)  # Shape (num_traj, 1)
 
         # Compute mean and variance across trajectories & move result to CPU
-        mean_cost = discounted_costs.mean().cpu()
-        std_cost = discounted_costs.std().cpu()
+        mean_cost = discounted_costs.mean().item()
+        std_cost = discounted_costs.std().item()
 
         return mean_cost, std_cost
     
-    def compute_cost_advantage(self, states, costs, update = False):
+    def compute_actual_cost(self, costs):  # costs: [N_episodes, T, 1] with ct in {0,1}
+        ep_costs = costs.sum(dim=1).squeeze(-1)     # [N_episodes]
+        return ep_costs.mean().item(), ep_costs.std(unbiased=False).item()    
+
+    def compute_cost_advantage(self, states, costs):
+        """
+        TD(0) critic target and advantage for the cost critic.
+        Returns:
+            adv_flat  : [B*T] tensor (detached, normalized)
+            value_loss: scalar MSE loss for the cost value network
+        """
         V = self.cost_value_nn(states)
+        V_det = V.detach()
 
-        old_V = V[:, : -1, :]
-        new_V = V[:, 1:, :]
+        # TD(0) advantage: A_t = c_t + γ V(s_{t+1}) - V(s_t)
+        adv = costs + self.gamma * V_det[: , 1: , : ] - V_det[: , : -1, : ]
 
-        if update:
-            target = costs + self.gamma * new_V.detach()
-            # Compute value loss for value network
-            # MSE between predicted V'(s) and V(s), i.e. E(A(s, a) ** 2)
-            value_loss = nn.functional.mse_loss(old_V, target)
-            return value_loss
+        # Critic target and loss: y_t = c_t + γ V(s_{t+1})   (no λ)
+        target = (costs + self.gamma * V_det[:, 1: , :]).detach()
+        pred = V[: , : -1, : ]
+        value_loss = torch.nn.functional.mse_loss(pred, target)
 
-        # Compute advantage loss (A part of policy network loss)
-        # A(s_t, a_t) = c_t + γ * V(s_{t+1}) - V(s_t)
-        # TD(0) is used here
-        advantage = costs + self.gamma * new_V - old_V
-        return advantage
+        # Flatten & normalize for the policy loss
+        adv_flat = adv.view(-1).detach()
+        # adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + self.eps)
+
+        return adv_flat, value_loss
     
 
     # Visualization
-    def get_heatmap(self, title=None):
-        """
-        Builds a log-probability state visitation heatmap by running
-        the policy in env. The heatmap is built using the provided
-        discretizer.
-        """
-        print("\nGetting heatmap using vectorized environments...")
-        
-        # Initialize state visitation count
+    def rarity_from_counts(self, ref_counts):
+        ref_counts = np.asarray(ref_counts, dtype=float)
+        ref_probs = (ref_counts + 1) / (ref_counts.sum() + ref_counts.size)
+        rarity_ref = -np.log(ref_probs)
+        return rarity_ref, ref_probs
+
+    def weighted_quantile(self, values, weights, q):
+        v = values.ravel(); w = weights.ravel().astype(float)
+        m = w > 0; v, w = v[m], w[m]
+        order = np.argsort(v); v, w = v[order], w[order]
+        cumw = np.cumsum(w); cumw /= cumw[-1]
+        q = np.atleast_1d(q)
+        return np.interp(q, cumw, v)
+
+    def tail_coverage_curve(self, rarity_ref, ref_probs, meth_counts, q_list=np.linspace(0.05, 0.5, 10)):
+        meth_counts = np.asarray(meth_counts, dtype=float)
+        meth_probs = meth_counts / (meth_counts.sum() + meth_counts.size)
+        # thresholds so that rarest q% under reference have rarity >= t_q
+        t = self.weighted_quantile(rarity_ref, ref_probs, 1 - q_list)
+        coverage = [(meth_probs[rarity_ref >= tq]).sum() for tq in t]
+        return q_list, np.array(coverage)
+
+    def get_simulations(self, best_epoch):
+        self._initialize_device()
+        self._initialize_envs()   
+        _ = self._initialize_networks()        
+        self.behavioral_policy.load_state_dict(torch.load(f"{self.out_path}/{best_epoch}-policy.pt"))
         state_dist = self.heatmap_discretizer.get_empty_mat()
+        np.random.seed(0)
+        torch.manual_seed(0)        
         states, actions, costs, next_states, distances, indices, state_dist = self.collect_particles_and_compute_knn(0, state_dist)
         with torch.inference_mode():
             importance_weights = self.compute_importance_weights(self.behavioral_policy, self.behavioral_policy, states, actions, True)
-            mean_entropy, std_entropy = self.compute_entropy(distances, indices, self.use_behavioral, self.zeta, importance_weights)   
+            mean_entropy, _ = self.compute_entropy(distances, indices, False, 1, importance_weights)   
         mean_entropy = mean_entropy.cpu().numpy()
-        std_entropy = std_entropy.cpu().numpy()
-        mean_cost, std_cost = self.compute_discounted_cost(costs)
+        mean_cost, _ = self.compute_discounted_cost(costs)
+        return states, costs, mean_entropy, mean_cost, state_dist
 
-        # Plot heatmap
-        plt.close()
-        fig, ax = plt.subplots()
-
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_xlabel(self.heatmap_labels[0])
-        ax.set_ylabel(self.heatmap_labels[1])
-
-        if len(state_dist.shape) == 2:
-            log_p = np.ma.log(state_dist)
-            flat = log_p.ravel()
-            m1 = flat.min()
-            flat[flat == m1] = flat[flat != m1].min()
-            im = ax.imshow(log_p.filled(m1),
-                        interpolation=self.heatmap_interp,
-                        cmap=self.heatmap_cmap)
-        else:
-            ax.bar(range(self.heatmap_discretizer.bins_sizes[0]), state_dist)
-
-        if self.env_id == 'CartPole-v1':
-            safety = self.envs.get_safety_threshold()
-            y_edges = self.heatmap_discretizer.bins[1]
-            y_lo = np.searchsorted(y_edges, -safety)
-            y_hi = np.searchsorted(y_edges, safety)
-            y0, y1 = ax.get_ylim()
-            ax.axhspan(y_lo, y1, color='red', alpha=0.3, label='Unsafe Region')
-            ax.axhspan(y0, y_hi, color='red', alpha=0.3)
-        elif self.env_id == 'Pendulum-v1':
-            safety_1, safety_2 = self.envs.get_safety_threshold()
-            x_edges = self.heatmap_discretizer.bins[0]
-            y_edges = self.heatmap_discretizer.bins[1]
-            x_idx = np.searchsorted(x_edges, safety_1)
-            y_lo = np.searchsorted(y_edges, -safety_2)
-            y_hi = np.searchsorted(y_edges, safety_2)
-            x0, _= ax.get_xlim()
-            y0, y1 = ax.get_ylim()     
-            ax.add_patch(Rectangle((x0, y_lo), x_idx - x0, y1 - y_lo,
-                                facecolor='red', alpha=0.3, label='Unsafe Region'))
-            ax.add_patch(Rectangle((x0, y0), x_idx - x0, y_hi - y0,
-                                facecolor='red', alpha=0.3))
-        else:
-            safety = self.envs.get_safety_threshold()
-            x_edges = self.heatmap_discretizer.bins[0]
-            x_idx = np.searchsorted(x_edges, safety)
-            x0, _ = ax.get_xlim()
-            ax.axvspan(x0, x_idx, color='red', alpha=0.3, label='Unsafe Region')
-
-        ax.legend()
-        if title:
-            ax.set_title(f"{title}\nAverage Entropy: {np.round(mean_entropy, 3)}, Average Total Cost: {np.round(mean_cost, 3)}")
-        plt.tight_layout()    
-
-        return state_dist, mean_entropy, mean_cost, fig      
-
-    def visualize_policy_comparison(self, num_states=1000):
+    def visualize_policy_comparison(self, best_epoch, num_states=1000):
+        self._initialize_device()
+        self._initialize_envs()   
         before_model = self.create_policy()
         after_model = self.create_policy()
         before_model.load_state_dict(torch.load(f"{self.out_path}/0-policy.pt"))
-        after_model.load_state_dict(self.behavioral_policy.state_dict())
+        after_model.load_state_dict(torch.load(f"{self.out_path}/{best_epoch}-policy.pt"))
 
         before_model.eval()
         after_model.eval()
@@ -407,11 +446,13 @@ class BaseAgent:
         plt.tight_layout()
         plt.savefig(f"{self.out_path}/action_comparison.png")
 
-    def visualize_policy_heatmap(self, use_mean=True):
+    def visualize_policy_heatmap(self, best_epoch, use_mean=True):
+        self._initialize_device()
+        self._initialize_envs()        
         before_model = self.create_policy()
         after_model = self.create_policy()
         before_model.load_state_dict(torch.load(f"{self.out_path}/0-policy.pt"))
-        after_model.load_state_dict(self.behavioral_policy.state_dict())
+        after_model.load_state_dict(torch.load(f"{self.out_path}/{best_epoch}-policy.pt"))
 
         before_model.eval()
         after_model.eval()
@@ -420,7 +461,9 @@ class BaseAgent:
         low_bounds = self.envs.single_observation_space.low
         high_bounds = self.envs.single_observation_space.high
 
-        if self.env_id == "Pendulum-v1":
+        if self.env_id == 'CartPole-v1':
+            state_idxs = [2, 0] 
+        elif self.env_id == 'Pendulum-v1':
             state_idxs = [0, 2]    
         else:    
             state_idxs = [0, 1]
@@ -441,6 +484,10 @@ class BaseAgent:
         with torch.no_grad():
             before_std, before_action = before_model(states, deterministic=True)
             after_std, after_action = after_model(states, deterministic=True) 
+
+        if self.env_id == "CartPole-v1":
+            before_action = before_action.argmax(dim=1, keepdim=True)
+            after_action = after_action.argmax(dim=1, keepdim=True)
 
         if use_mean:
             before = before_action.cpu().numpy().reshape(grid_x.shape)
@@ -477,15 +524,84 @@ class BaseAgent:
 
             if self.env_id == "Pendulum-v1":
                 safety_threshold_1, safety_threshold_2 = self.envs.get_safety_threshold()
-                ax.axvline(x=safety_threshold_1, color='red', linestyle='--', linewidth=2)
-                ax.axvline(y=-safety_threshold_2, color='red', linestyle='--', linewidth=2)  
-                ax.axvline(y=safety_threshold_2, color='red', linestyle='--', linewidth=2)
+                ax.axvline(x=safety_threshold_1, color='red', linestyle='--', linewidth=10)
+                ax.axvline(y=-safety_threshold_2, color='red', linestyle='--', linewidth=10)  
+                ax.axvline(y=safety_threshold_2, color='red', linestyle='--', linewidth=10)
             elif self.env_id == "MountainCarContinuous-v0":
                 safety_threshold = self.envs.get_safety_threshold()
-                ax.axvline(x=safety_threshold, color='red', linestyle='--', linewidth=2)           
+                ax.axvline(x=safety_threshold, color='red', linestyle='--', linewidth=10)   
+            elif self.env_id == "CartPole-v1":
+                safety_threshold = self.envs.get_safety_threshold()
+                ax.axhline(y=-safety_threshold, color='red', linestyle='--', linewidth=10)
+                ax.axhline(y=safety_threshold, color='red', linestyle='--', linewidth=10)                                
 
         plt.tight_layout()
         plt.savefig(f"{self.out_path}/action_{'mean' if use_mean else 'std'}_heatmap.png")
+
+    def best_epoch_vis(self):    
+        df_heatmap = pd.read_csv(f"{self.out_path}/best_epochs.csv")
+        fig, ax = plt.subplots(figsize=(7,4))
+        palette = {"Yes (Dangerous)": "#d62728", "No (Safe)": "#1f77b4"}      
+        sns.scatterplot(data=df_heatmap, x="best_epoch", y="heatmap_entropy", hue="exceed_threshold", hue_order=["Yes (Dangerous)", "No (Safe)"], palette=palette, ax=ax)
+        ax.axhline(df_heatmap.loc[df_heatmap["best_epoch"] == 0, "heatmap_entropy"].iloc[0], ls="--", color="grey", label="Initial Heatmap Entropy")
+        ax.set_xlabel("Best Epoch")
+        ax.set_ylabel("Heatmap Entropy")
+        ax.legend(title="Exceed Safety Threshold")
+        ax.set_title(f"{self.env_id[: -3]}: Change in Heatmap Entropy\nover Best Epochs with New Minimum Policy Loss\nUsing {self.alg_name} Algorithm and {self.entropy_name}")
+        fig.tight_layout()
+        entropy_file_name = (self.entropy_name
+                                .lower()
+                                .replace("(", "")
+                                .replace(")", "")
+                                .replace("$", "")
+                                .replace("\\", "")
+                                .replace("", "")
+                                .replace("=", " ")
+                                .replace(" entropy", "")
+                                .replace(" ", "_"))           
+        fig.savefig(f"{self.out_path}/epoch_heatmap_entropy_{self.alg_name.lower()}_{entropy_file_name}_{self.env_id}.png")
+        plt.close('all') 
+        true_best_epoch = df_heatmap.loc[df_heatmap["heatmap_entropy"].idxmax()]["best_epoch"]
+        if self.alg_name == "CEM":
+            self.cem_vis(true_best_epoch)
+        elif self.alg_name == "RENYI":
+            self.renyi_vis(true_best_epoch)
+
+    def compute_best_epochs(self):    
+        best_epochs = sorted(
+            {int(m.group(1))
+            for p in Path(self.out_path).iterdir()
+            if (m := re.match(r'^(\d+)-policy\.pt$', p.name))}
+        ) 
+        init_states, init_costs, init_entropy, init_mean_cost, init_state_dict = self.get_simulations(0)
+        entropy_lst = []
+        cost_lst = []
+
+        for best_epoch in best_epochs:
+            final_states, final_costs, final_entropy, final_mean_cost, final_state_dict = self.get_simulations(best_epoch)  
+            self._plot_rarity(best_epoch, init_state_dict, final_state_dict)
+            self._plot_heatmap(final_entropy, final_mean_cost, final_state_dict, best_epoch)
+            self._plot_tsne(best_epoch, init_states, init_costs, init_entropy, init_mean_cost, final_states, final_costs, final_entropy, final_mean_cost) 
+
+            if best_epoch == 0:
+                entropy_lst.append(init_entropy)
+                cost_lst.append(init_mean_cost)        
+            else:
+                entropy_lst.append(final_entropy)
+                cost_lst.append(final_mean_cost)   
+
+            if hasattr(self, "envs") and self.envs is not None:
+                try:
+                    self.envs.close()
+                except Exception as e:
+                    print(f"Failed to close envs: {e}")
+                self.envs = None
+
+        df_heatmap = pd.DataFrame({"best_epoch": best_epochs, "heatmap_entropy": entropy_lst, "heatmap_cost": cost_lst})  
+        df_heatmap["exceed_threshold"] = np.where(df_heatmap["heatmap_cost"] > self.safety_constraint, "Yes (Dangerous)", "No (Safe)")  
+        df_heatmap.to_csv(f"{self.out_path}/best_epochs.csv", index=False) 
+
+        self.best_epoch_vis()            
 
 
     # Main Training
@@ -513,16 +629,65 @@ class BaseAgent:
         self.B = np.log(self.k) - scipy.special.digamma(self.k)
         self.G = scipy.special.gamma(self.state_dim / 2 + 1)  
 
-    def _plot_heatmap(self, best_epoch):
+    def _plot_heatmap(self, mean_entropy, mean_cost, state_dist, best_epoch=0):
         # Heatmap
         if self.heatmap_discretizer is not None:
-            heatmap_ver = "initial"
-            if best_epoch != 0:
-                model_link = os.path.join(self.out_path, f"{best_epoch}-policy.pt")
-                self.behavioral_policy.load_state_dict(torch.load(model_link))
-                heatmap_ver = "final"
-            _, heatmap_entropy, heatmap_cost, heatmap_image = \
-                self.get_heatmap(f"{heatmap_ver.title()} States Exploration Heatmap of {self.env_id[: -3]} \nUsing {self.alg_name} Algorithm and {self.entropy_name}")
+            heatmap_ver = "initial" if best_epoch == 0 else "final"
+            title = f"{heatmap_ver.title()} States Exploration Heatmap of {self.env_id[: -3]} \nUsing {self.alg_name} Algorithm and {self.entropy_name}"
+            
+            # Plot heatmap
+            plt.close()
+            fig, ax = plt.subplots()
+
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_xlabel(self.heatmap_labels[0])
+            ax.set_ylabel(self.heatmap_labels[1])
+
+            if len(state_dist.shape) == 2:
+                log_p = np.ma.log(state_dist)
+                flat = log_p.ravel()
+                m1 = flat.min()
+                flat[flat == m1] = flat[flat != m1].min()
+                im = ax.imshow(log_p.filled(m1).T,
+                               origin='lower',
+                               interpolation=self.heatmap_interp,
+                               cmap=self.heatmap_cmap)
+            else:
+                ax.bar(range(self.heatmap_discretizer.bins_sizes[0]), state_dist)
+
+            if self.env_id == 'CartPole-v1':
+                safety = self.envs.get_safety_threshold()
+                y_edges = self.heatmap_discretizer.bins[1]        
+                y_lo = np.searchsorted(y_edges, -safety)
+                y_hi = np.searchsorted(y_edges, safety)
+                y0, y1 = ax.get_ylim()
+                ax.axhspan(y_lo, y0, color='red', alpha=0.3, label='Unsafe Region')
+                ax.axhspan(y1, y_hi, color='red', alpha=0.3)
+            elif self.env_id == 'Pendulum-v1':
+                safety_1, safety_2 = self.envs.get_safety_threshold()
+                x_edges = self.heatmap_discretizer.bins[0]
+                y_edges = self.heatmap_discretizer.bins[1]
+                x_idx = np.searchsorted(x_edges, safety_1)
+                y_lo = np.searchsorted(y_edges, -safety_2)
+                y_hi = np.searchsorted(y_edges, safety_2)
+                x0, _= ax.get_xlim()
+                y0, y1 = ax.get_ylim()     
+                ax.add_patch(Rectangle((x0, y_lo), x_idx - x0, y1 - y_lo,
+                                    facecolor='red', alpha=0.3, label='Unsafe Region'))
+                ax.add_patch(Rectangle((x0, y0), x_idx - x0, y_hi - y0,
+                                    facecolor='red', alpha=0.3))
+            else:
+                safety = self.envs.get_safety_threshold()
+                x_edges = self.heatmap_discretizer.bins[0]
+                x_idx = np.searchsorted(x_edges, safety)
+                x0, _ = ax.get_xlim()
+                ax.axvspan(x0, x_idx, color='red', alpha=0.3, label='Unsafe Region')
+
+            ax.legend(frameon=False, loc='best')
+            ax.set_title(f"{title}\nCoverage Entropy: {mean_entropy:.3f}, Expected Cost: {mean_cost:.3f}")
+            plt.tight_layout()
+                      
             entropy_file_name = (self.entropy_name
                                  .lower()
                                  .replace("(", "")
@@ -533,43 +698,144 @@ class BaseAgent:
                                  .replace("=", " ")
                                  .replace(" entropy", "")
                                  .replace(" ", "_"))
-            heatmap_image.savefig(f"{self.out_path}/{heatmap_ver}_heatmap_{self.alg_name.lower()}_{entropy_file_name}_{self.env_id}.png")
-            plt.close(heatmap_image)    
+            fig.savefig(f"{self.out_path}/{best_epoch}_heatmap_{self.alg_name.lower()}_{entropy_file_name}_{self.env_id}.png")
+            plt.close(fig)    
+
+    def _plot_tsne(self, best_epoch, init_states, init_costs, init_entropy, init_mean_cost, final_states, final_costs, final_entropy, final_mean_cost):
+        norm_states = torch.cat((init_states, final_states), 0)
+        norm_states = norm_states.reshape(-1, norm_states.shape[2])
+        zero_col = torch.zeros(self.episode_nr, 1, 1, device=init_states.device, dtype=init_states.dtype)
+        init_costs = torch.cat((zero_col, init_costs), dim=1).reshape(-1)
+        final_costs = torch.cat((zero_col, final_costs), dim=1).reshape(-1)
+        init_unsafe = (init_costs.cpu().numpy() > 0)
+        final_unsafe = (final_costs.cpu().numpy() > 0)
+        init_safe = ~init_unsafe
+        final_safe = ~final_unsafe     
+        norm_states = norm_states.cpu().numpy()
+
+        if self.env_id == "CartPole-v1":
+            tsne_states = norm_states[:, [2, 0]]
+        elif self.env_id == "MountainCarContinuous-v0":
+            tsne_states = norm_states   
         else:
-            heatmap_entropy = None
-            heatmap_cost = None
-            heatmap_image = None   
-  
-        return heatmap_entropy, heatmap_cost, heatmap_image
+            tsne = TSNE(n_components=2, perplexity=min(30, len(norm_states) // 3), random_state=42)
+            tsne_states = tsne.fit_transform(norm_states)
 
+        # Plot heatmap
+        plt.close()
+        fig, ax = plt.subplots()
 
-    # Utilities
-    def compare_heatmap(self, model_init, model_final):    
-        """
-        T: Number of trajectories/episodes
-        N: Number of time steps
-        """
-        self._initialize_device()
-        self._initialize_envs()
+        ax.set_xticks([])
+        ax.set_yticks([])
+        if self.env_id == "CartPole-v1":
+            ax.set_xlabel("Pole Angle")
+            ax.set_ylabel("Cart Position")
+        elif self.env_id == "MountainCarContinuous-v0":
+            ax.set_xlabel("Position")
+            ax.set_ylabel("Velocity")
+        else:      
+            ax.set_xlabel("TSNE Feature 1")
+            ax.set_ylabel("TSNE Feature 2")                          
 
-        model_lst = [model_init, model_final]
-        title_lst = ["Initial", "Final"]
+        init_points = tsne_states[: tsne_states.shape[0] // 2]
+        final_points = tsne_states[tsne_states.shape[0] // 2: ]
 
-        for model_link, title_txt in zip(model_lst, title_lst):
-            # Create a behavioral, a target policy and a tmp policy used to save valid target policies
-            # (those with kl <= kl_threshold) during off policy opt
-            first_layer_neuron = 400 if self.env_id == "SafetyPointGoal1-v0" else 300
-            second_layer_neuron = 300            
-            self.behavioral_policy = PolicyNetwork(self.state_dim, self.action_dim, first_layer_neuron, second_layer_neuron, self.state_dependent_std, self.is_discrete, self.device)  # Recreate the model architecture
-            self.behavioral_policy.load_state_dict(torch.load(model_link))
-            self.behavioral_policy.to(self.device)  # Move model to the correct device (CPU/GPU)
-            self.behavioral_policy.eval()  # Set to evaluation mode (disables dropout, batch norm, etc.)
-            title = f"Heatmap of {title_txt} Epoch State Exploration"
+        start_idx = [i * init_states.shape[1] for i in range(init_states.shape[0] * 2)]
+        start_pts = tsne_states[start_idx]
+     
+        if self.env_id == "SafetyPointGoal1-v0":
+            alpha1 = 0.02
+            alpha2 = 0.4
+        else:
+            alpha1 = 0.1  
+            alpha2 = 0.8
 
-            # Heatmap
-            _, heatmap_entropy, heatmap_cost, heatmap_image = \
-                self.get_heatmap(title)
-            plt.close(heatmap_image)
+        ax.scatter(init_points[init_safe, 0], init_points[init_safe, 1], 
+                s=5, c='red', alpha=alpha1, marker='o', label='_nolegend_')
+        ax.scatter(init_points[init_unsafe, 0], init_points[init_unsafe, 1], 
+                s=5, c='red', alpha=alpha2, marker='^', label='_nolegend_')
+        ax.scatter(final_points[final_safe, 0], final_points[final_safe, 1], 
+                s=5, c='blue', alpha=alpha1, marker='o', label='_nolegend_')
+        ax.scatter(final_points[final_unsafe, 0], final_points[final_unsafe, 1], 
+                s=5, c='blue', alpha=alpha2, marker='^', label='_nolegend_')              
+        ax.scatter(start_pts[: , 0], start_pts[: , 1], s=10, color='black', alpha=0.5, marker='x', label='_nolegend_')
+       
+        legend_init_safe = mlines.Line2D([], [], color='red', marker='o', linestyle='None',
+                                    markersize=5, alpha=0.25, label='Initial Model (Safe States)')
+        legend_init_unsafe = mlines.Line2D([], [], color='red', marker='^', linestyle='None',
+                                    markersize=5, alpha=1, label='Initial Model (Unsafe States)')
+        legend_final_safe = mlines.Line2D([], [], color='blue', marker='o', linestyle='None',
+                                    markersize=5, alpha=0.25, label='Final Model (Safe States)')
+        legend_final_unsafe = mlines.Line2D([], [], color='blue', marker='^', linestyle='None',
+                                    markersize=5, alpha=1, label='Final Model (Unsafe States)')        
+        legend_start = mlines.Line2D([], [], color='black', marker='x', linestyle='None',
+                                    markersize=5, alpha=1, label='Starting States')
 
-        if isinstance(self.envs, gymnasium.vector.VectorEnv) or isinstance(self.envs, safety_gymnasium.vector.VectorEnv):
-            self.envs.close()
+        # Add legend with custom handles
+        ax.legend(handles=[legend_init_safe, legend_init_unsafe, legend_final_safe, legend_final_unsafe, legend_start], loc='center left', bbox_to_anchor=(1.02, 0.5), borderaxespad=0)        
+
+        if self.env_id == "SafetyPointGoal1-v0":
+            title = f"States Exploration TSNE Plot of {self.env_id[: -3]} \nUsing {self.alg_name} Algorithm and {self.entropy_name}\nInitial Average Entropy: {np.round(init_entropy, 3)}, Initial Average Total Cost: {np.round(init_mean_cost, 3)}\nFinal Average Entropy: {np.round(final_entropy, 3)}, Final Average Total Cost: {np.round(final_mean_cost, 3)}"
+        else:
+            title = f"States Exploration Plot of {self.env_id[: -3]} \nUsing {self.alg_name} Algorithm and {self.entropy_name}\nInitial Average Entropy: {np.round(init_entropy, 3)}, Initial Average Total Cost: {np.round(init_mean_cost, 3)}\nFinal Average Entropy: {np.round(final_entropy, 3)}, Final Average Total Cost: {np.round(final_mean_cost, 3)}"
+
+        ax.set_title(title)
+        plt.tight_layout()
+
+        entropy_file_name = (self.entropy_name
+                                .lower()
+                                .replace("(", "")
+                                .replace(")", "")
+                                .replace("$", "")
+                                .replace("\\", "")
+                                .replace("", "")
+                                .replace("=", " ")
+                                .replace(" entropy", "")
+                                .replace(" ", "_"))
+        fig.savefig(f"{self.out_path}/{best_epoch}_tsne_{self.alg_name.lower()}_{entropy_file_name}_{self.env_id}.png", bbox_inches='tight')
+        plt.close(fig)
+
+    def _plot_rarity(self, best_epoch, ref_counts, meth_counts):
+        rarity_ref, ref_probs = self.rarity_from_counts(ref_counts)
+        q, coverage = self.tail_coverage_curve(rarity_ref, ref_probs, meth_counts, q_list=np.r_[0.0, np.linspace(0.01, 0.5, 25), np.linspace(0.6, 0.99, 20), 1.0])
+        auc = np.trapz(coverage, q)
+
+        plt.close()      
+        fig, ax = plt.subplots(1, 2, figsize=(9, 4))
+
+        im = ax[0].imshow(rarity_ref.T, origin='lower', cmap='magma')
+        ax[0].set_title("Rarity Map ($−\log p_{ref}$)")
+        ax[0].set_xlabel("Bin $x$"); ax[0].set_ylabel("Bin $y$")
+        cbar = plt.colorbar(im, ax=ax[0], fraction=0.046, pad=0.04)
+        cbar.set_label("Rarity (Higher = Rarer)")
+        handles, labels = ax[0].get_legend_handles_labels()
+
+        for alt_q, per_q, color, linestyle, in [(0.1, 10, 'blue', '--')]:
+            tq = self.weighted_quantile(rarity_ref, ref_probs, 1 - alt_q).item()
+            cs = ax[0].contour((rarity_ref >= tq).T.astype(int), levels=[0.5], colors=color, linewidths=1.5, linestyles=linestyle)
+            h = mlines.Line2D([0],[0], color=color, lw=1.6, ls=linestyle, label=f"Rarest {per_q}%")          
+            handles += [h]
+            labels += [h.get_label()]            
+        ax[0].legend(handles, labels, loc='upper left', frameon=True, facecolor='white')
+
+        # (B) Tail-coverage curve for the method
+        ax[1].plot(q * 100, coverage, marker='o')
+        ax[1].set_xlabel("Rarest q% of States (w.r.t. Baseline)")
+        ax[1].set_ylabel("Method Mass in Tail (↑)")
+        ax[1].set_title(f"Tail Coverage of {self.env_id[: -3]} \nUsing {self.alg_name} Algorithm and {self.entropy_name}\nAUC: {np.round(auc * 100, 3)}%")
+        ax[1].grid(alpha=0.3)
+
+        plt.tight_layout()
+
+        entropy_file_name = (self.entropy_name
+                                .lower()
+                                .replace("(", "")
+                                .replace(")", "")
+                                .replace("$", "")
+                                .replace("\\", "")
+                                .replace("", "")
+                                .replace("=", " ")
+                                .replace(" entropy", "")
+                                .replace(" ", "_"))
+        fig.savefig(f"{self.out_path}/{best_epoch}_rarity_{self.alg_name.lower()}_{entropy_file_name}_{self.env_id}.png", bbox_inches='tight')
+        plt.close(fig)           

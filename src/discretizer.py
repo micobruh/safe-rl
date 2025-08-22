@@ -27,7 +27,7 @@ def create_discretizer(envs, env_id, num_bins=40):
     Creates a Discretizer object for a given Safety Gymnasium environment.
     """
     if env_id == 'CartPole-v1':
-        state_idxs = [2, 0]
+        state_idxs = [2, 0] 
     elif env_id == 'Pendulum-v1':
         state_idxs = [0, 2]    
     else:    

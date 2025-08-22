@@ -2,15 +2,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
-# Check if GPU is available and determine the device
-if torch.cuda.is_available():
-    device = 'cuda:0'
-else:
-    device = 'cpu'
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+EPS = 1e-5
 
-PI = torch.from_numpy(np.asarray(np.pi))
-EPS = 1.e-5
+def _two_pi_like(x):  # scalar on same device/dtype
+    return x.new_tensor(2.0 * math.pi)
+# PI = torch.from_numpy(np.asarray(np.pi))
 
 def log_categorical(x, p, num_classes=256, reduction=None):
     x_one_hot = F.one_hot(x.long(), num_classes=num_classes)
@@ -33,24 +32,38 @@ def log_bernoulli(x, p, reduction=None):
         return log_p
     
 def log_normal_diag(x, mu, log_var, reduction=None):
-    D = x.shape[1]
-    log_p = -0.5 * torch.log(2. * PI) - 0.5 * log_var - 0.5 * torch.exp(-log_var) * (x - mu)**2.
+    # D = x.shape[1]
+    # log_p = -0.5 * torch.log(2. * PI) - 0.5 * log_var - 0.5 * torch.exp(-log_var) * (x - mu)**2.
+    # if reduction == 'mean':
+    #     return torch.mean(torch.sum(log_p, list(range(1, len(x.shape)))))
+    # elif reduction == 'sum':
+    #     return torch.sum(torch.sum(log_p, list(range(1, len(x.shape)))))
+    # else:
+    #     return log_p
+    log_p = -0.5 * (torch.log(_two_pi_like(x)) + log_var + torch.exp(-log_var) * (x - mu) ** 2)
     if reduction == 'mean':
-        return torch.mean(torch.sum(log_p, list(range(1, len(x.shape)))))
+        return torch.sum(log_p, dim=tuple(range(1, log_p.ndim))).mean(0)
     elif reduction == 'sum':
-        return torch.sum(torch.sum(log_p, list(range(1, len(x.shape)))))
+        return torch.sum(log_p, dim=tuple(range(1, log_p.ndim))).sum(0)
     else:
-        return log_p
+        return log_p    
 
 def log_standard_normal(x, reduction=None):
-    D = x.shape[1]
-    log_p = -0.5 * torch.log(2. * PI) - 0.5 * x**2.
+    # D = x.shape[1]
+    # log_p = -0.5 * torch.log(2. * PI) - 0.5 * x**2.
+    # if reduction == 'mean':
+    #     return torch.mean(log_p, list(range(1, len(x.shape))))
+    # elif reduction == 'sum':
+    #     return torch.sum(log_p, list(range(1, len(x.shape))))
+    # else:
+    #     return log_p
+    log_p = -0.5 * (torch.log(_two_pi_like(x)) + x ** 2)
     if reduction == 'mean':
-        return torch.mean(log_p, list(range(1, len(x.shape))))
+        return torch.sum(log_p, dim=tuple(range(1, log_p.ndim))).mean(0)
     elif reduction == 'sum':
-        return torch.sum(log_p, list(range(1, len(x.shape))))
+        return torch.sum(log_p, dim=tuple(range(1, log_p.ndim))).sum(0)
     else:
-        return log_p
+        return log_p        
 
 class Encoder(nn.Module):
     def __init__(self, encoder_net):
@@ -105,9 +118,11 @@ class Encoder(nn.Module):
     
     def forward(self, x, type='log_prob'):
         # return is the log-probability
-        assert type in ['encode', 'log_prob'], 'Type could be either encode or log_prob'
+        assert type in ['encode', 'log_prob', 'sample'], 'Type could be either encode or log_prob'
         if type == 'log_prob':
             return self.log_prob(x)
+        elif type == 'encode':
+            return self.encode(x)
         else:
             return self.sample(x)
 
@@ -122,6 +137,7 @@ class Decoder(nn.Module):
         # First, we apply the decoder network.
         h_d = self.decoder(z)
         mu, log_var = torch.chunk(h_d, 2, dim=1)  # split into mean and logvar
+        log_var = torch.clamp(log_var, min=-4, max=4)
         return [mu, log_var]        
     
     def sample(self, z):
@@ -137,21 +153,20 @@ class Decoder(nn.Module):
         # return is the log-probability
         outs = self.decode(z)
         mu, log_var = outs
-        # log_p = log_normal_diag(x, mu, log_var, reduction='sum')
         log_p = log_normal_diag(x, mu, log_var)
         log_p = torch.sum(log_p, dim=1)
         return log_p
     
     def forward(self, z, x=None, type='log_prob'):
         # return is the log-probability
-        assert type in ['decoder', 'log_prob'], 'Type could be either decode or log_prob'
+        assert type in ['decode', 'log_prob'], 'Type could be either decode or log_prob'
         if type == 'log_prob':
             return self.log_prob(x, z)
         else:
-            return self.sample(x)
+            return self.sample(z)
 
 class Prior(nn.Module):
-    def __init__(self, L, num_components, multiplier = 1):
+    def __init__(self, L, num_components, multiplier=1):
         super(Prior, self).__init__()
         self.L = L
         self.num_components = num_components
@@ -161,26 +176,35 @@ class Prior(nn.Module):
         # mixing weights
         self.w = nn.Parameter(torch.zeros(num_components, 1, 1))
 
+    # def sample(self, batch_size):
+    #     # return is a sample
+    #     # mu, log_var
+    #     means, logvars = self.means, self.logvars
+    #     means = means.to(device)
+    #     logvars = logvars.to(device)
+    #     # mixing probabilities
+    #     w = F.softmax(self.w, dim=0)
+    #     w = w.squeeze().to(device)
+    #     # pick components
+    #     indexes = torch.multinomial(w, batch_size, replacement=True).to(device)
+    #     # means and logvars
+    #     eps = torch.randn(batch_size, self.L).to(device)
+    #     for i in range(batch_size):
+    #         indx = indexes[i]
+    #         if i == 0:
+    #             z = means[[indx]] + eps[[i]] * torch.exp(logvars[[indx]])
+    #         else:
+    #             z = torch.cat((z, means[[indx]] + eps[[i]] * torch.exp(logvars[[indx]])), 0)
+    #     return z
+
     def sample(self, batch_size):
-        # return is a sample
-        # mu, log_var
-        means, logvars = self.means, self.logvars
-        means = means.to(device)
-        logvars = logvars.to(device)
-        # mixing probabilities
-        w = F.softmax(self.w, dim=0)
-        w = w.squeeze().to(device)
-        # pick components
-        indexes = torch.multinomial(w, batch_size, replacement=True).to(device)
-        # means and logvars
-        eps = torch.randn(batch_size, self.L).to(device)
-        for i in range(batch_size):
-            indx = indexes[i]
-            if i == 0:
-                z = means[[indx]] + eps[[i]] * torch.exp(logvars[[indx]])
-            else:
-                z = torch.cat((z, means[[indx]] + eps[[i]] * torch.exp(logvars[[indx]])), 0)
-        return z
+        means, logvars = self.means.to(device), self.logvars.to(device)
+        stds = torch.exp(0.5 * logvars)
+        w = F.softmax(self.w, dim=0).squeeze().to(device)
+        idx = torch.multinomial(w, batch_size, replacement=True)
+        eps = torch.randn(batch_size, self.L, device=device)
+        z = means[idx] + eps * stds[idx]
+        return z    
 
     def log_prob(self, z):
         # return is the log-probability
@@ -203,6 +227,7 @@ class VAE(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.prior = prior
+        # self.beta = 0.1
 
     def sample(self, batch_size=64):
         # return is a sample
@@ -211,6 +236,7 @@ class VAE(nn.Module):
         return self.decoder.sample(z)
 
     def forward(self, x, reduction='mean'):
+        # self.beta = min(10, self.beta + 0.2)
         # encoder
         mu_e, log_var_e = self.encoder.encode(x)
         z = self.encoder.sample(x=x, mu_e=mu_e, log_var_e=log_var_e)
@@ -221,48 +247,16 @@ class VAE(nn.Module):
 
         error = 0
         if np.isnan(RE.detach().cpu().numpy()).any():
-            print('RE {}'.format(RE))
+            print("\nRE is nan")
             error = 1
         if np.isnan(KL.detach().cpu().numpy()).any():
-            print('RE {}'.format(KL))
+            print("\nKL is nan")
             error = 1
 
         if error == 1:
             raise ValueError()
 
         if reduction == 'sum':
-            return -(RE + KL).sum()
+            return -(RE + KL).sum(), RE.mean(), KL.mean()
         else:
-            return -(RE + KL).mean()    
-        
-# # use all necessary code to initialize your VAE
-# # Remember that the encoder outputs 2 times more values because we need L means and L log-variances for a Gaussian.
-# num_components = 16
-
-# state_dim = 3   # Example: Pendulum (cos(theta), sin(theta), theta_dot)
-# action_dim = 1  # Pendulum has 1 continuous torque action
-# D = state_dim + action_dim  # Input dimension
-# L = 32          # Number of latents
-# M = 256         # The number of neurons in scale (s) and translation (t) nets
-# lr = 1e-3       # learning rate
-# likelihood_type = 'gaussian'  # New likelihood we'll add
-
-# # First, we initialize the encoder and the decoder
-# # -encoder
-# encoder_net = nn.Sequential(nn.Linear(D, M), nn.ReLU(),
-#                         nn.Linear(M, M), nn.ReLU(),
-#                         nn.Linear(M, 2 * L))
-
-# encoder = Encoder(encoder_net=encoder_net)
-
-# # -decoder
-# decoder_net = nn.Sequential(nn.Linear(L, M), nn.ReLU(),
-#                         nn.Linear(M, M), nn.ReLU(),
-#                         nn.Linear(M, 2 * D))
-
-# decoder = Decoder(distribution=likelihood_type, decoder_net=decoder_net)
-
-# prior = Prior(L=L, num_components=num_components)
-
-# # Eventually, we initialize the full model
-# model = VAE(encoder=encoder, decoder=decoder, prior=prior, likelihood_type=likelihood_type)
+            return -(RE + KL).mean(), RE.mean(), KL.mean()    
